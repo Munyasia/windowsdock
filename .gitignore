@@ -1,6 +1,8 @@
 # Logs
 logs
 *.log
+# Git Bash crash dumps (tauri dev's Rust watcher skips gitignored files)
+*.stackdump
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

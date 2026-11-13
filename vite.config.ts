@@ -26,8 +26,10 @@ export default defineConfig(async () => ({
 				}
 			: undefined,
 		watch: {
-			// 3. tell Vite to ignore watching `src-tauri`
-			ignored: ["**/src-tauri/**"]
+			// 3. tell Vite to ignore watching `src-tauri`, and Git Bash crash
+			// dumps: a dump still locked by its writer makes the watcher throw
+			// EBUSY, which ends Vite and the whole `tauri dev` session with it.
+			ignored: ["**/src-tauri/**", "**/*.stackdump"]
 		}
 	},
 
