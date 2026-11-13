@@ -1,3 +1,5 @@
+> **WindowsDock** is a personal fork of Bloom by Sehajveer Singh, maintained by [Muse](https://github.com/Munyasia). See [WINDOWSDOCK.md](WINDOWSDOCK.md) for setup and what changed. The original README follows.
+
 <div align="center">
 
 <img 

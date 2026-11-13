@@ -127,7 +127,7 @@ function SettingsApp() {
 
 			<div className="settings-body">
 				<div className="settings-sidebar">
-					<div className="settings-sidebar-intro"><strong>Bloom</strong><span>Make it yours</span></div>
+					<div className="settings-sidebar-intro"><strong>WindowsDock</strong><span>Make it yours</span></div>
 					{TABS.map(({ id, label, icon: Icon }) => (
 						<button
 							key={id}

@@ -1,8 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "bloom",
+  "productName": "WindowsDock",
+  "mainBinaryName": "bloom",
   "version": "3.10.2",
-  "identifier": "com.sehaz.bloom",
+  "identifier": "com.munyasia.windowsdock",
   "build": {
     "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:1420",
@@ -97,18 +98,18 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: blob:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' ipc: http://ipc.localhost https://api.open-meteo.com https://geocoding-api.open-meteo.com https://ipapi.co http://ip-api.com https://bloom.sehaz.space"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: blob:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' ipc: http://ipc.localhost https://api.open-meteo.com https://geocoding-api.open-meteo.com https://ipapi.co http://ip-api.com"
     }
   },
   "bundle": {
     "active": true,
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "targets": "all",
-    "publisher": "Sehajveer Singh",
-    "copyright": "Copyright © 2026 Sehajveer Singh",
+    "publisher": "Muse (Munyasia)",
+    "copyright": "Copyright © 2026 Sehajveer Singh (Bloom). Modifications © 2026 Muse (Munyasia). GPL-3.0",
     "category": "Utility",
     "shortDescription": "A notch and dock for Windows",
-    "longDescription": "Bloom replaces the Windows taskbar with a dock and adds a notch for media, quick controls and status.",
+    "longDescription": "WindowsDock (a fork of Bloom) replaces the Windows taskbar with a dock and adds a notch for media, quick controls and status.",
     "windows": {
       "webviewInstallMode": {
         "type": "embedBootstrapper"
@@ -126,7 +127,7 @@
     "updater": {
       "active": true,
       "endpoints": [
-        "https://github.com/SehajveerSingh2005/bloom/releases/latest/download/latest.json"
+        "https://github.com/Munyasia/windowsdock/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQzQTAzNTlBRUFFODRFMDUKUldRRlR1anFtaldnUThWRExWQ2ZDVmxhNGlFREFPYWZoV1BWbGdQNUxxdHpnbzZPbGh4SWxVMk0K"
     }

@@ -10,7 +10,9 @@ export interface Announcement {
 	url?: string;
 }
 
-const ENDPOINT = "https://bloom.sehaz.space/announcements.json";
+// WindowsDock fork: upstream announcements are off (they come from the original
+// author's site). Put your own URL here later to enable your own notices.
+const ENDPOINT = "";
 const CACHE_KEY = "bloom-announcement-cache";
 const CACHE_AT_KEY = "bloom-announcement-cache-at";
 const DISMISSED_KEY = "bloom-announcement-dismissed";
@@ -45,6 +47,7 @@ function readCached(): Announcement | null {
 }
 
 function fetchAnnouncement(): Promise<Announcement | null> {
+	if (!ENDPOINT) return Promise.resolve(null);
 	if (!inflight) {
 		inflight = (async () => {
 			const controller = new AbortController();

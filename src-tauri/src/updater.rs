@@ -22,6 +22,10 @@ const MIN_AUTO_INSTALL_AGE_SECS: i64 = 24 * 60 * 60;
 /// on every startup, because the process exits from inside the install path.
 const AUTO_INSTALL_RETRY_SECS: i64 = 24 * 60 * 60;
 const STATE_FILE: &str = "update-state.json";
+/// WindowsDock fork: updates are OFF. The upstream Bloom updater would install the
+/// original author's release over this fork. Set to `true` only after you have
+/// your own signing key and GitHub releases (see WINDOWSDOCK.md).
+const UPDATES_ENABLED: bool = false;
 
 /// Serializes manifest requests so concurrent callers share a single network hit.
 static CHECK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -137,6 +141,9 @@ fn install_attempted_recently(state: &PersistedUpdateState, version: &str, now: 
 /// is set. Development builds skip the automatic network check because their
 /// version never tracks releases; manual checks still work.
 pub async fn check(app: &AppHandle, force: bool) -> Result<UpdateCheckResult, String> {
+    if !UPDATES_ENABLED {
+        return Ok(UpdateCheckResult::default());
+    }
     if !force {
         if let Some(cached) = cached_result(app) {
             return Ok(cached);
@@ -201,6 +208,9 @@ pub async fn check(app: &AppHandle, force: bool) -> Result<UpdateCheckResult, St
 /// launches the NSIS installer and terminates this process, which then
 /// relaunches the app; on other platforms this returns after restarting.
 pub async fn install(app: &AppHandle) -> Result<(), String> {
+    if !UPDATES_ENABLED {
+        return Err("updates are disabled in this build".to_string());
+    }
     if UPDATE_BUSY.swap(true, Ordering::SeqCst) {
         return Err("an update is already in progress".to_string());
     }
