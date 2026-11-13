@@ -689,7 +689,7 @@ fn toggle_start_menu() {
 }
 
 #[tauri::command]
-pub async fn open_app(app: AppHandle, app_name: String) {
+pub async fn open_app(app: AppHandle, app_name: String, profile: Option<String>) {
     if app_name == "start" {
         toggle_start_menu();
         return;
@@ -700,7 +700,15 @@ pub async fn open_app(app: AppHandle, app_name: String) {
         return;
     }
 
-    tauri::async_runtime::spawn_blocking(move || launch_path(&app_name));
+    tauri::async_runtime::spawn_blocking(move || {
+        // A pinned browser profile opens in that profile, not the last used one.
+        if let Some(profile) = profile.as_deref() {
+            if launch_browser_profile(&app_name, profile) {
+                return;
+            }
+        }
+        launch_path(&app_name)
+    });
 }
 
 fn is_bloom_launch_target(target: &str, identifier: &str) -> bool {
@@ -715,10 +723,19 @@ fn is_bloom_launch_target(target: &str, identifier: &str) -> bool {
 /// Running browser PWAs are relaunched through their Start Menu shortcut so the
 /// new window belongs to the web app rather than the bare browser.
 #[tauri::command]
-pub async fn launch_new_instance(app_path: String, app_name: Option<String>) {
+pub async fn launch_new_instance(
+    app_path: String,
+    app_name: Option<String>,
+    profile: Option<String>,
+) {
     tauri::async_runtime::spawn_blocking(move || {
         if app_path == "start" {
             return;
+        }
+        if let Some(profile) = profile.as_deref() {
+            if launch_browser_profile(&app_path, profile) {
+                return;
+            }
         }
         let target = pwa_launch_target(&app_path, app_name.as_deref()).unwrap_or(app_path);
         launch_path(&target);
@@ -866,22 +883,12 @@ pub async fn get_active_windows() -> Vec<AppInfo> {
         let mut grouped: HashMap<String, AppInfo> = HashMap::new();
 
         for app in apps {
-            let path = app.path.to_lowercase();
-            let name = app.name.to_lowercase();
-
-            // For host processes (Edge, Chrome, Brave, ApplicationFrameHost), use path + name
-            // so that different PWAs/UWP apps are separate dock items.
-            let key = if path.contains("msedge.exe")
-                || path.contains("chrome.exe")
-                || path.contains("brave.exe")
-                || path.contains("applicationframehost.exe")
-            {
-                format!("{}:{}", path, name)
-            } else if let Some(ref exe) = app.executable {
-                format!("{}:{}", path, exe.to_lowercase())
-            } else {
-                path.clone()
-            };
+            let key = window_group_key(
+                &app.path,
+                &app.name,
+                app.executable.as_deref(),
+                app.profile.as_deref(),
+            );
 
             if let Some(existing) = grouped.get_mut(&key) {
                 if let Some(ref mut hwnds) = existing.all_hwnds {
@@ -1144,21 +1151,34 @@ pub async fn focus_window(app: AppHandle, hwnd: isize) -> bool {
 /// window in a stable order is, so repeated clicks visit every window instead
 /// of flipping between the two most recent.
 #[tauri::command]
-pub async fn focus_app_windows(hwnds: Vec<isize>) {
+pub async fn focus_app_windows(app: AppHandle, hwnds: Vec<isize>) {
+    let dock = app
+        .get_webview_window("dock")
+        .and_then(|window| window.hwnd().ok())
+        .map(|dock| dock.0 as isize);
     tauri::async_runtime::spawn_blocking(move || unsafe {
         use windows::Win32::UI::WindowsAndMessaging::{
-            GetForegroundWindow, IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow,
-            SW_RESTORE, SW_SHOW,
+            BringWindowToTop, FlashWindow, GetAncestor, GetForegroundWindow, IsIconic,
+            IsWindowVisible, SetForegroundWindow, ShowWindow, GA_ROOTOWNER, SW_RESTORE, SW_SHOW,
         };
-        let Some(&most_recent) = hwnds.first() else {
+        // Clicking the dock can make it the foreground window for a moment,
+        // as in `focus_window`. Without this the window in front was never
+        // found among `hwnds`, so every click re-activated the most recent
+        // window and the item could never move on to its other windows.
+        let mut foreground = GetForegroundWindow();
+        if dock == Some(foreground.0 as isize) {
+            if let Some(last) = last_focused_window() {
+                foreground = last;
+            }
+        }
+        // A dialog or popup a window owns counts as that window.
+        let in_front = if hwnds.contains(&(foreground.0 as isize)) {
+            foreground
+        } else {
+            GetAncestor(foreground, GA_ROOTOWNER)
+        };
+        let Some(target) = next_window_to_focus(&hwnds, Some(in_front.0 as isize)) else {
             return;
-        };
-        let foreground = GetForegroundWindow().0 as isize;
-        let mut ring = hwnds.clone();
-        ring.sort_unstable();
-        let target = match ring.iter().position(|&h| h == foreground) {
-            Some(i) => ring[(i + 1) % ring.len()],
-            None => most_recent,
         };
 
         let hwnd = HWND(target as *mut _);
@@ -1169,20 +1189,221 @@ pub async fn focus_app_windows(hwnds: Vec<isize>) {
             bring_restore_position_on_screen(hwnd);
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
-        let _ = SetForegroundWindow(hwnd);
+        if SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd {
+            return;
+        }
+        // Foreground activation is restricted by Windows: uncover the window
+        // and retry once, then flash it, as `focus_window` does.
+        let _ = BringWindowToTop(hwnd);
+        if GetForegroundWindow() == hwnd
+            || (SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd)
+        {
+            return;
+        }
+        let _ = FlashWindow(hwnd, true);
     })
     .await
     .unwrap_or_default();
 }
 
+/// Chromium browsers whose profiles and installed web apps all run under the
+/// one executable.
+fn is_chromium_browser(path_lc: &str) -> bool {
+    path_lc.contains("msedge.exe") || path_lc.contains("chrome.exe") || path_lc.contains("brave.exe")
+}
+
+/// Hosts that run many separate apps under one executable: Chromium browsers
+/// (profiles, installed web apps) and ApplicationFrameHost (UWP apps).
+fn is_multi_app_host(path_lc: &str) -> bool {
+    is_chromium_browser(path_lc) || path_lc.contains("applicationframehost.exe")
+}
+
+/// The key `get_active_windows` groups windows into dock items by.
+///
+/// Windows of a multi-app host are told apart by their name (a web app's or
+/// UWP app's title), except regular browser windows of a multi-profile
+/// browser: those are grouped by profile directory, so every window of one
+/// profile shares an item whatever its title, and two profiles never do.
+/// The NUL separator keeps a profile key from ever equalling a name key.
+/// Other apps group by their executable.
+pub(crate) fn window_group_key(
+    path: &str,
+    name: &str,
+    executable: Option<&str>,
+    profile: Option<&str>,
+) -> String {
+    let path = path.to_lowercase();
+    if is_multi_app_host(&path) {
+        match profile {
+            Some(profile) => format!("{}\0profile:{}", path, profile.to_lowercase()),
+            None => format!("{}:{}", path, name.to_lowercase()),
+        }
+    } else if let Some(exe) = executable {
+        format!("{}:{}", path, exe.to_lowercase())
+    } else {
+        path
+    }
+}
+
+/// The browser profile a regular Chrome/Edge/Brave window belongs to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct BrowserProfile {
+    /// Directory under the browser's User Data folder: "Default", "Profile 1".
+    pub dir: String,
+    /// The profile's own name, as the taskbar shows it: "Work".
+    pub label: String,
+}
+
+/// Which profile a regular (non web app) browser window belongs to, from the
+/// shell properties Chromium stamps on it. None while the browser has a
+/// single profile, so those windows stay one item, as on the taskbar.
+///
+/// Chromium sets the relaunch command to `chrome.exe --profile-directory=X`.
+/// Once there are several profiles it also sets the relaunch display name to
+/// `<profile name> - Chrome` and gives every profile but Default its own
+/// AppUserModelID (`Chrome.UserData.Profile1`). The Default profile keeps the
+/// browser's plain id (`Chrome`), the one its pinned shortcut carries.
+pub(crate) fn browser_profile(
+    aumid: Option<&str>,
+    relaunch_command: Option<&str>,
+    relaunch_display_name: Option<&str>,
+) -> Option<BrowserProfile> {
+    let dir = extract_arg(relaunch_command?, "--profile-directory=")?;
+    browser_profile_args(&dir)?;
+    let label = relaunch_display_name
+        // `@file,-id` is an indirect resource string, not a name.
+        .filter(|name| !name.starts_with('@'))
+        .and_then(|name| name.rsplit_once(" - "))
+        .map(|(label, _)| label.trim().to_string())
+        .filter(|label| !label.is_empty());
+    let has_profile_aumid = aumid.is_some_and(|id| id.to_lowercase().contains(".userdata."));
+    match label {
+        Some(label) => Some(BrowserProfile { dir, label }),
+        None if has_profile_aumid => Some(BrowserProfile {
+            label: dir.clone(),
+            dir,
+        }),
+        None => None,
+    }
+}
+
+/// Dock name of a browser profile item: "Google Chrome (Work)".
+pub(crate) fn browser_profile_item_name(browser: &str, profile: &BrowserProfile) -> String {
+    format!("{} ({})", browser, profile.label)
+}
+
+/// Command-line arguments that open a browser window in a profile. None for a
+/// directory name that could escape the quotes or the User Data folder.
+pub(crate) fn browser_profile_args(profile_dir: &str) -> Option<String> {
+    let dir = profile_dir.trim();
+    if dir.is_empty() || dir == "." || dir == ".." || dir.contains(['"', '\\', '/']) {
+        return None;
+    }
+    Some(format!("--profile-directory=\"{}\"", dir))
+}
+
+/// The file of a shell icon resource string (`C:\…\Google Profile.ico,0`).
+pub(crate) fn icon_resource_file(resource: &str) -> Option<String> {
+    let resource = resource.trim().trim_start_matches('@');
+    let file = match resource.rsplit_once(',') {
+        Some((file, index)) if index.trim().parse::<i32>().is_ok() => file,
+        _ => resource,
+    };
+    let file = file.trim().trim_matches('"');
+    (!file.is_empty()).then(|| file.to_string())
+}
+
+/// The badged profile icon Chromium writes into a profile folder once there
+/// are several profiles (`Google Profile.ico`, `Edge Profile.ico`, ...). Used
+/// for a pinned profile with no window to read the icon from.
+fn browser_profile_icon_file(exe_path: &str, profile_dir: &str) -> Option<String> {
+    browser_profile_args(profile_dir)?;
+    let exe = exe_path.to_lowercase();
+    let user_data = if exe.contains("msedge.exe") {
+        "Microsoft\\Edge\\User Data"
+    } else if exe.contains("brave.exe") {
+        "BraveSoftware\\Brave-Browser\\User Data"
+    } else if exe.contains("chrome.exe") {
+        "Google\\Chrome\\User Data"
+    } else {
+        return None;
+    };
+    let local = std::env::var("LOCALAPPDATA").ok()?;
+    let dir = std::path::Path::new(&local)
+        .join(user_data)
+        .join(profile_dir.trim());
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.to_lowercase().ends_with(" profile.ico"))
+        })
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// Opens a new window of a Chromium browser in one profile. False when the
+/// target is not such a browser or the profile name is unusable, so the
+/// caller can fall back to a plain launch.
+fn launch_browser_profile(exe_path: &str, profile_dir: &str) -> bool {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let Some(args) = browser_profile_args(profile_dir) else {
+        return false;
+    };
+    if !is_chromium_browser(&exe_path.to_lowercase()) {
+        return false;
+    }
+    let exe = if exe_path.contains('\\') || exe_path.contains('/') {
+        exe_path.to_string()
+    } else {
+        match resolve_executable_path(exe_path) {
+            Some(resolved) => resolved,
+            None => return false,
+        }
+    };
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let (open, file, params) = (wide("open"), wide(&exe), wide(&args));
+    let res = unsafe {
+        ShellExecuteW(
+            None,
+            windows::core::PCWSTR(open.as_ptr()),
+            windows::core::PCWSTR(file.as_ptr()),
+            windows::core::PCWSTR(params.as_ptr()),
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+    if res.0 as usize <= 32 {
+        eprintln!("Failed to open {} {}: error code {}", exe, args, res.0 as usize);
+        return false;
+    }
+    true
+}
+
+/// Which window of a multi-window dock item a click brings forward. `hwnds`
+/// comes most-recently-focused first. With none of them in front, the most
+/// recent one; with one in front, the next in a stable (sorted) order, so
+/// repeated clicks visit every window instead of re-activating the same one.
+pub(crate) fn next_window_to_focus(hwnds: &[isize], in_front: Option<isize>) -> Option<isize> {
+    let &most_recent = hwnds.first()?;
+    let mut ring = hwnds.to_vec();
+    ring.sort_unstable();
+    ring.dedup();
+    Some(
+        match in_front.and_then(|front| ring.iter().position(|&h| h == front)) {
+            Some(i) => ring[(i + 1) % ring.len()],
+            None => most_recent,
+        },
+    )
+}
+
 fn get_cache_key(path: &str, name: Option<&str>) -> String {
     let path_lc = path.to_lowercase();
     let name_lc = name.map(|n| n.to_lowercase()).unwrap_or_default();
-    if path_lc.contains("msedge.exe")
-        || path_lc.contains("chrome.exe")
-        || path_lc.contains("brave.exe")
-        || path_lc.contains("applicationframehost.exe")
-    {
+    if is_multi_app_host(&path_lc) {
         format!("{}:{}", path, name_lc)
     } else {
         path.to_string()
@@ -1684,6 +1905,7 @@ pub async fn get_app_icon(
     path: String,
     name: Option<String>,
     hwnd: Option<isize>,
+    profile: Option<String>,
 ) -> Result<Option<String>, String> {
     let cache_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     let cache_path = cache_dir.join("icons_cache.json");
@@ -1764,6 +1986,46 @@ pub async fn get_app_icon(
                 windows::Win32::System::Com::CoUninitialize();
             }
             icon
+        })
+        .await
+        .unwrap_or(None);
+
+        if let Some(base64) = result {
+            if let Ok(mut c) = cache.lock() {
+                c.insert(cache_key.clone(), base64.clone());
+            }
+            schedule_icon_cache_save(app);
+            return Ok(Some(base64));
+        }
+    }
+
+    // Strategy 2b: A browser profile item shows the profile's badged icon, the
+    // one the taskbar shows: the window's relaunch icon, or for a pin with no
+    // window the icon file in the profile folder. Only regular browser windows
+    // carry a profile, so web apps keep their own icons below.
+    if let Some(profile) = profile.filter(|_| is_chromium_browser(&path.to_lowercase())) {
+        let path_owned = path.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let window_icon = hwnd.and_then(|h| {
+                let com = unsafe {
+                    windows::Win32::System::Com::CoInitializeEx(
+                        None,
+                        windows::Win32::System::Com::COINIT_MULTITHREADED,
+                    )
+                    .is_ok()
+                };
+                let resource = crate::utils::get_window_relaunch_icon(HWND(h as *mut _));
+                if com {
+                    unsafe { windows::Win32::System::Com::CoUninitialize() };
+                }
+                resource.as_deref().and_then(icon_resource_file)
+            });
+            window_icon
+                .and_then(|file| image_file_to_base64(&file))
+                .or_else(|| {
+                    browser_profile_icon_file(&path_owned, &profile)
+                        .and_then(|file| image_file_to_base64(&file))
+                })
         })
         .await
         .unwrap_or(None);
@@ -1996,6 +2258,7 @@ pub async fn load_pinned_apps(app: AppHandle) -> Vec<AppInfo> {
             hwnd: None,
             executable: Some("explorer.exe".into()),
             all_hwnds: None,
+            profile: None,
         },
         AppInfo {
             name: "Microsoft Edge".into(),
@@ -2005,6 +2268,7 @@ pub async fn load_pinned_apps(app: AppHandle) -> Vec<AppInfo> {
             hwnd: None,
             executable: Some("msedge.exe".into()),
             all_hwnds: None,
+            profile: None,
         },
         AppInfo {
             name: "Notepad".into(),
@@ -2014,6 +2278,7 @@ pub async fn load_pinned_apps(app: AppHandle) -> Vec<AppInfo> {
             hwnd: None,
             executable: Some("notepad.exe".into()),
             all_hwnds: None,
+            profile: None,
         },
         AppInfo {
             name: "Settings".into(),
@@ -2023,6 +2288,7 @@ pub async fn load_pinned_apps(app: AppHandle) -> Vec<AppInfo> {
             hwnd: None,
             executable: None,
             all_hwnds: None,
+            profile: None,
         },
     ]
 }
@@ -4295,6 +4561,7 @@ mod pwa_icon_tests {
             hwnd: None,
             executable: Some("brave.exe".into()),
             all_hwnds: None,
+            profile: None,
         };
         assert!(is_pwa_shortcut_for(&app, "youtube", "brave.exe"));
         assert!(is_pwa_shortcut_for(&app, "YouTube", "BRAVE.EXE"));
@@ -4335,6 +4602,7 @@ mod pwa_icon_tests {
                 hwnd: None,
                 executable: Some("brave.exe".into()),
                 all_hwnds: None,
+                profile: None,
             },
             AppInfo {
                 name: "Netflix".into(),
@@ -4344,6 +4612,7 @@ mod pwa_icon_tests {
                 hwnd: None,
                 executable: Some("msedge.exe".into()),
                 all_hwnds: None,
+                profile: None,
             },
         ]));
         assert_eq!(
@@ -4463,4 +4732,261 @@ pub async fn activate_tray_icon(tray_id: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || crate::tray::interact(&tray_id, false))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod browser_profile_tests {
+    use super::*;
+
+    const CHROME: &str = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+    const EDGE: &str = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+    const BRAVE: &str = "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe";
+
+    fn profile(dir: &str, label: &str) -> Option<BrowserProfile> {
+        Some(BrowserProfile {
+            dir: dir.into(),
+            label: label.into(),
+        })
+    }
+
+    #[test]
+    fn each_browser_profile_is_its_own_group() {
+        let work = window_group_key(
+            CHROME,
+            "Google Chrome (Work)",
+            Some("chrome.exe"),
+            Some("Profile 1"),
+        );
+        let home = window_group_key(
+            CHROME,
+            "Google Chrome (Home)",
+            Some("chrome.exe"),
+            Some("Default"),
+        );
+        assert_ne!(work, home);
+        // Before the fix both profiles were named "Google Chrome" and shared a key.
+        assert_ne!(
+            work,
+            window_group_key(CHROME, "Google Chrome", Some("chrome.exe"), None)
+        );
+    }
+
+    #[test]
+    fn windows_of_one_profile_share_a_group() {
+        let a = window_group_key(
+            CHROME,
+            "Google Chrome (Work)",
+            Some("chrome.exe"),
+            Some("Profile 1"),
+        );
+        let b = window_group_key(
+            CHROME,
+            "Google Chrome (Work)",
+            Some("chrome.exe"),
+            Some("profile 1"),
+        );
+        assert_eq!(a, b);
+        // The profile directory, not the name, is the identity: windows read
+        // before and after a profile rename still group together.
+        let renamed = window_group_key(
+            CHROME,
+            "Google Chrome (Job)",
+            Some("chrome.exe"),
+            Some("Profile 1"),
+        );
+        assert_eq!(a, renamed);
+    }
+
+    #[test]
+    fn single_profile_browser_and_web_apps_keep_name_groups() {
+        assert_eq!(
+            window_group_key(CHROME, "Google Chrome", Some("chrome.exe"), None),
+            format!("{}:google chrome", CHROME.to_lowercase())
+        );
+        let youtube = window_group_key(CHROME, "YouTube", Some("chrome.exe"), None);
+        let music = window_group_key(CHROME, "YouTube Music", Some("chrome.exe"), None);
+        assert_ne!(youtube, music);
+        // A web app titled like a profile key never lands in a profile group.
+        assert_ne!(
+            window_group_key(CHROME, "\0profile:default", Some("chrome.exe"), None),
+            window_group_key(CHROME, "x", Some("chrome.exe"), Some("default"))
+        );
+    }
+
+    #[test]
+    fn same_profile_dir_in_different_browsers_is_separate() {
+        assert_ne!(
+            window_group_key(
+                CHROME,
+                "Google Chrome (Work)",
+                Some("chrome.exe"),
+                Some("Default")
+            ),
+            window_group_key(
+                EDGE,
+                "Microsoft Edge (Work)",
+                Some("msedge.exe"),
+                Some("Default")
+            )
+        );
+    }
+
+    #[test]
+    fn other_apps_group_by_executable_or_path() {
+        let path = "C:\\Program Files\\Steam\\steam.exe";
+        assert_eq!(
+            window_group_key(path, "Steam", Some("Steam.exe"), None),
+            format!("{}:steam.exe", path.to_lowercase())
+        );
+        assert_eq!(
+            window_group_key(path, "Steam", None, None),
+            path.to_lowercase()
+        );
+        // A stray profile on a non-host never changes its group.
+        assert_eq!(
+            window_group_key(path, "Steam", Some("steam.exe"), Some("Profile 1")),
+            window_group_key(path, "Other title", Some("steam.exe"), None)
+        );
+        let uwp = "C:\\Windows\\System32\\ApplicationFrameHost.exe";
+        assert_ne!(
+            window_group_key(uwp, "Calculator", Some("ApplicationFrameHost.exe"), None),
+            window_group_key(uwp, "Photos", Some("ApplicationFrameHost.exe"), None)
+        );
+    }
+
+    #[test]
+    fn reads_profile_from_chrome_window_properties() {
+        let command = format!("\"{}\" --profile-directory=\"Profile 1\"", CHROME);
+        assert_eq!(
+            browser_profile(
+                Some("Chrome.UserData.Profile1"),
+                Some(&command),
+                Some("Work - Chrome")
+            ),
+            profile("Profile 1", "Work")
+        );
+        // The Default profile keeps the plain browser id but is still a profile.
+        let default = format!("\"{}\" --profile-directory=Default", CHROME);
+        assert_eq!(
+            browser_profile(Some("Chrome"), Some(&default), Some("Muse - Chrome")),
+            profile("Default", "Muse")
+        );
+        // A profile name may itself contain " - ".
+        assert_eq!(
+            browser_profile(Some("Chrome"), Some(&default), Some("A - B - Google Chrome")),
+            profile("Default", "A - B")
+        );
+    }
+
+    #[test]
+    fn edge_and_brave_profiles_use_the_same_properties() {
+        let edge = format!("\"{}\" --profile-directory=\"Profile 2\"", EDGE);
+        assert_eq!(
+            browser_profile(
+                Some("MSEdge.UserData.Profile2"),
+                Some(&edge),
+                Some("Work - Edge")
+            ),
+            profile("Profile 2", "Work")
+        );
+        let brave = format!("\"{}\" --profile-directory=\"Profile 3\"", BRAVE);
+        assert_eq!(
+            browser_profile(
+                Some("Brave.UserData.Profile3"),
+                Some(&brave),
+                Some("Home - Brave")
+            ),
+            profile("Profile 3", "Home")
+        );
+    }
+
+    #[test]
+    fn single_profile_browser_has_no_profile_item() {
+        let default = format!("\"{}\" --profile-directory=Default", CHROME);
+        // One profile: Chrome names the button after itself only.
+        assert_eq!(
+            browser_profile(Some("Chrome"), Some(&default), Some("Google Chrome")),
+            None
+        );
+        assert_eq!(browser_profile(Some("Chrome"), Some(&default), None), None);
+        // No relaunch command: nothing to launch the profile with.
+        assert_eq!(
+            browser_profile(Some("Chrome.UserData.Profile1"), None, Some("Work - Chrome")),
+            None
+        );
+    }
+
+    #[test]
+    fn profile_without_display_name_is_labelled_by_directory() {
+        let command = format!("\"{}\" --profile-directory=\"Profile 1\"", CHROME);
+        assert_eq!(
+            browser_profile(Some("Chrome.UserData.Profile1"), Some(&command), None),
+            profile("Profile 1", "Profile 1")
+        );
+        // An indirect resource string is not a profile name.
+        assert_eq!(
+            browser_profile(
+                Some("Chrome.UserData.Profile1"),
+                Some(&command),
+                Some("@C:\\x.dll,-101")
+            ),
+            profile("Profile 1", "Profile 1")
+        );
+    }
+
+    #[test]
+    fn unsafe_profile_directories_are_rejected() {
+        for dir in ["..", "..\\Other", "a/b", "x\" --evil", ""] {
+            assert_eq!(browser_profile_args(dir), None, "{dir}");
+        }
+        assert_eq!(
+            browser_profile_args("Profile 1").as_deref(),
+            Some("--profile-directory=\"Profile 1\"")
+        );
+        let traversal = format!("\"{}\" --profile-directory=\"..\\..\\x\"", CHROME);
+        assert_eq!(
+            browser_profile(
+                Some("Chrome.UserData.x"),
+                Some(&traversal),
+                Some("X - Chrome")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn profile_item_name_includes_the_profile() {
+        let work = profile("Profile 1", "Work").unwrap();
+        assert_eq!(
+            browser_profile_item_name("Google Chrome", &work),
+            "Google Chrome (Work)"
+        );
+    }
+
+    #[test]
+    fn icon_resource_file_strips_the_index() {
+        let ico = "C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\User Data\\Profile 1\\Google Profile.ico";
+        assert_eq!(icon_resource_file(&format!("{ico},0")).as_deref(), Some(ico));
+        assert_eq!(icon_resource_file(&format!("{ico},-3")).as_deref(), Some(ico));
+        assert_eq!(icon_resource_file(ico).as_deref(), Some(ico));
+        assert_eq!(
+            icon_resource_file("C:\\a,b\\c.ico").as_deref(),
+            Some("C:\\a,b\\c.ico")
+        );
+        assert_eq!(icon_resource_file(" ,0"), None);
+    }
+
+    #[test]
+    fn repeated_clicks_cycle_through_every_window() {
+        // Most recently focused first, as get_active_windows sorts them.
+        let hwnds = [30, 10, 20];
+        // Nothing of the item in front: the most recent window.
+        assert_eq!(next_window_to_focus(&hwnds, None), Some(30));
+        assert_eq!(next_window_to_focus(&hwnds, Some(999)), Some(30));
+        // One in front: the next in sorted order, wrapping around.
+        assert_eq!(next_window_to_focus(&hwnds, Some(30)), Some(10));
+        assert_eq!(next_window_to_focus(&hwnds, Some(10)), Some(20));
+        assert_eq!(next_window_to_focus(&hwnds, Some(20)), Some(30));
+        assert_eq!(next_window_to_focus(&[], Some(1)), None);
+    }
 }

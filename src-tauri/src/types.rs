@@ -63,6 +63,12 @@ pub struct AppInfo {
     pub hwnd: Option<isize>,
     pub executable: Option<String>,
     pub all_hwnds: Option<Vec<(isize, String)>>, // (hwnd, title)
+    /// Browser profile directory ("Default", "Profile 1") of a regular
+    /// Chrome/Edge/Brave window while the browser has several profiles. Each
+    /// profile is its own dock item, as on the taskbar; a pin keeps it so the
+    /// pin relaunches that profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 #[derive(Clone, Serialize)]

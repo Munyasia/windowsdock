@@ -999,6 +999,21 @@ pub fn get_window_relaunch_command(hwnd: HWND) -> Option<String> {
     get_window_string_property(hwnd, 2)
 }
 
+/// Reads `System.AppUserModel.RelaunchIconResource`: the icon the taskbar
+/// shows for the window's button, as `path,index`. Chromium browsers set it to
+/// the profile's badged icon (`<profile>\Google Profile.ico`) once there are
+/// several profiles.
+pub fn get_window_relaunch_icon(hwnd: HWND) -> Option<String> {
+    get_window_string_property(hwnd, 3)
+}
+
+/// Reads `System.AppUserModel.RelaunchDisplayNameResource`: the name the
+/// taskbar shows for the window's button. Chromium browsers set it to
+/// `<profile name> - Chrome` once there are several profiles.
+pub fn get_window_relaunch_display_name(hwnd: HWND) -> Option<String> {
+    get_window_string_property(hwnd, 4)
+}
+
 /// The executable named by a relaunch command, when the command is a bare,
 /// existing `.exe` path without arguments. Commands with arguments (browser
 /// profiles, launchers) are not an app identity and are ignored.

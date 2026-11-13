@@ -13,6 +13,7 @@ import {
 	dockIconKey,
 	matchesPackagedExecutable,
 	mergeTrayApps,
+	sameBrowserProfile,
 	selectDockTrayApps,
 	type AppInfo,
 	type TrayApp
@@ -30,11 +31,17 @@ export function isBrowserHost(path: string) {
 }
 
 // Stable identity for a dock item.
-export function appIdentity(p: string, executable?: string, name?: string) {
+export function appIdentity(p: string, executable?: string, name?: string, profile?: string) {
 	if (!p) return "";
 	const normalized = p.toLowerCase().replace(/\\/g, "/");
 	// Shell application ids (AUMIDs) and bare names are unique on their own.
 	if (!normalized.includes("/")) return normalized;
+	// Each profile of a multi-profile browser is its own item, identified by
+	// its directory so a renamed profile keeps its pin. Mirrors the backend's
+	// window_group_key.
+	if (profile && isBrowserHost(normalized)) {
+		return `${normalized}:profile:${profile.toLowerCase()}`;
+	}
 	if (name && isBrowserHost(normalized)) {
 		return `${normalized}:${name.toLowerCase()}`;
 	}
@@ -42,7 +49,7 @@ export function appIdentity(p: string, executable?: string, name?: string) {
 	return normalized;
 }
 
-const itemKey = (app: AppInfo) => appIdentity(app.path, app.executable, app.name);
+const itemKey = (app: AppInfo) => appIdentity(app.path, app.executable, app.name, app.profile);
 
 // WinEvent notifications can arrive for windows that do not change the dock.
 // Keep the existing array when its visible content is identical so Framer
@@ -73,6 +80,8 @@ function sameRunningApps(left: AppInfo[], right: AppInfo[]): boolean {
 export function isSameApp(a: AppInfo, b: AppInfo): boolean {
 	if (!a.path || !b.path) return false;
 	if (itemKey(a) === itemKey(b)) return true;
+	// Two browser profiles are separate apps even though they share an exe.
+	if (!sameBrowserProfile(a, b)) return false;
 	if (matchesPackagedExecutable(a, b)) return true;
 	// Browser hosts run many apps under one exe — only the full identity
 	// (which folds in the window/AUMID name) can match those.
@@ -424,7 +433,7 @@ const Dock = memo(function Dock() {
 
 			const pinned = await invoke<AppInfo[]>("load_pinned_apps");
 			setPinnedApps(pinned.map((a) => ({ ...a, is_pinned: true })));
-			pinned.forEach((app) => fetchIcon(app.path, app.name));
+			pinned.forEach((app) => fetchIcon(app.path, app.name, undefined, app.profile));
 
 			// Warm the installed-apps cache in the background so the add-app
 			// popup opens with data ready instead of waiting on the scan.
@@ -565,7 +574,7 @@ const Dock = memo(function Dock() {
 			setActiveApps((prev) => (sameRunningApps(prev, running) ? prev : running));
 
 			setActiveOrder((prev) => {
-				const newPaths = running.map((r) => appIdentity(r.path, r.executable, r.name));
+				const newPaths = running.map(itemKey);
 				const existingPaths = prev.filter((p) => newPaths.includes(p));
 				const addedPaths = newPaths.filter((p) => !prev.includes(p));
 				const next = [...existingPaths, ...addedPaths];
@@ -574,8 +583,8 @@ const Dock = memo(function Dock() {
 					: next;
 			});
 
-			pinnedApps.forEach((app) => fetchIcon(app.path, app.name));
-			running.forEach((app) => fetchIcon(app.path, app.name, app.hwnd));
+			pinnedApps.forEach((app) => fetchIcon(app.path, app.name, undefined, app.profile));
+			running.forEach((app) => fetchIcon(app.path, app.name, app.hwnd, app.profile));
 		};
 
 		poll();
@@ -594,7 +603,7 @@ const Dock = memo(function Dock() {
 		};
 	}, [isDragging, pinnedApps]);
 
-	const fetchIcon = async (path: string, name?: string, hwnd?: number) => {
+	const fetchIcon = async (path: string, name?: string, hwnd?: number, profile?: string) => {
 		const isHost = isBrowserHost(path);
 		const cacheKey =
 			isHost && name ? `${path}:${name.toLowerCase()}` : hwnd ? `${path}-${hwnd}` : path;
@@ -606,7 +615,8 @@ const Dock = memo(function Dock() {
 			const icon = await invoke<string | null>("get_app_icon", {
 				path,
 				name: name || null,
-				hwnd: hwnd || null
+				hwnd: hwnd || null,
+				profile: profile || null
 			});
 			if (icon && generation === iconGenerationRef.current) {
 				iconsRef.current[cacheKey] = icon;
@@ -629,7 +639,7 @@ const Dock = memo(function Dock() {
 			pendingIconsRef.current.clear();
 			iconsRef.current = {};
 			setIconsTick((t) => t + 1);
-			pinnedApps.forEach((app) => fetchIcon(app.path, app.name));
+			pinnedApps.forEach((app) => fetchIcon(app.path, app.name, undefined, app.profile));
 		} catch (e) {
 			console.error("Failed to clear icon cache:", e);
 		}
@@ -681,7 +691,7 @@ const Dock = memo(function Dock() {
 			delete iconsRef.current[app.path];
 			if (app.hwnd) delete iconsRef.current[`${app.path}-${app.hwnd}`];
 			setIconsTick((t) => t + 1);
-			fetchIcon(app.path, app.name, app.hwnd);
+			fetchIcon(app.path, app.name, app.hwnd, app.profile);
 		} catch (err) {
 			console.error("Failed to remove custom icon:", err);
 		}
@@ -717,7 +727,7 @@ const Dock = memo(function Dock() {
 			} else if (app.hwnd) {
 				await invoke("focus_window", { hwnd: app.hwnd });
 			} else {
-				await invoke("open_app", { appName: app.path });
+				await invoke("open_app", { appName: app.path, profile: app.profile ?? null });
 			}
 		} catch (e) {
 			console.error(`Failed to interact with ${app.name}:`, e);
@@ -728,7 +738,11 @@ const Dock = memo(function Dock() {
 	const handleNewInstance = async (app: AppInfo) => {
 		if (!app || app.path === "start") return;
 		try {
-			await invoke("launch_new_instance", { appPath: app.path, appName: app.name });
+			await invoke("launch_new_instance", {
+				appPath: app.path,
+				appName: app.name,
+				profile: app.profile ?? null
+			});
 		} catch (e) {
 			console.error(`Failed to launch a new instance of ${app.name}:`, e);
 		}
@@ -752,7 +766,7 @@ const Dock = memo(function Dock() {
 			// window vs installed shortcut) must never create a duplicate.
 			if (pinnedApps.some((a) => isSameApp(a, app))) return;
 			newPinned = [...pinnedApps, { ...app, is_pinned: true, is_running: false, hwnd: undefined }];
-			fetchIcon(app.path, app.name);
+			fetchIcon(app.path, app.name, undefined, app.profile);
 		}
 		setPinnedApps(newPinned);
 		await invoke("save_pinned_apps", { apps: newPinned });
@@ -977,37 +991,47 @@ const Dock = memo(function Dock() {
 	const dockItems = useMemo(() => {
 		const runningMap = new Map();
 		activeApps.forEach((a) => {
-			const id = appIdentity(a.path, a.executable, a.name);
+			const id = itemKey(a);
 			if (!runningMap.has(id)) runningMap.set(id, a);
 		});
 
 		const matchedRunningKeys = new Set<string>();
 
+		// Fuzzy fallbacks never cross browser profiles: a plain browser pin
+		// stands for the Default profile and a profile pin only for its own
+		// profile. Among candidates, the Default profile's browser windows win
+		// over a web app that happens to share the browser's exe.
+		const findFuzzy = (p: AppInfo, matches: (a: AppInfo) => boolean) => {
+			const candidates = activeApps.filter((a) => sameBrowserProfile(p, a) && matches(a));
+			return candidates.find((a) => a.profile) ?? candidates[0];
+		};
+
 		const findRunningApp = (p: AppInfo) => {
 			// 1. Try exact match by identity
-			const id = appIdentity(p.path, p.executable, p.name);
+			const id = itemKey(p);
 			let running = runningMap.get(id);
 			if (running) {
-				matchedRunningKeys.add(appIdentity(running.path, running.executable, running.name));
+				matchedRunningKeys.add(itemKey(running));
 				return running;
 			}
 
 			// 2. Try match by path (without executable)
 			const pathId = appIdentity(p.path);
 			running = runningMap.get(pathId);
-			if (running) {
-				matchedRunningKeys.add(appIdentity(running.path, running.executable, running.name));
+			if (running && sameBrowserProfile(p, running)) {
+				matchedRunningKeys.add(itemKey(running));
 				return running;
 			}
 
 			// 3. Try fallback match by executable name if defined
 			if (p.executable) {
 				const targetExe = p.executable.toLowerCase();
-				const found = activeApps.find(
+				const found = findFuzzy(
+					p,
 					(a) => !isIdentifier(a.path) && a.executable?.toLowerCase() === targetExe
 				);
 				if (found) {
-					matchedRunningKeys.add(appIdentity(found.path, found.executable, found.name));
+					matchedRunningKeys.add(itemKey(found));
 					return found;
 				}
 			}
@@ -1015,7 +1039,7 @@ const Dock = memo(function Dock() {
 			// 4. Try fallback match by path's file name (e.g., if path is "msedge" and running app's executable is "msedge.exe")
 			const pinFilename = p.path.split("/").pop()?.split("\\").pop()?.toLowerCase() || "";
 			if (pinFilename) {
-				const found = activeApps.find((a) => {
+				const found = findFuzzy(p, (a) => {
 					if (isIdentifier(a.path)) return false;
 					const runExe =
 						a.executable?.toLowerCase() ||
@@ -1028,7 +1052,7 @@ const Dock = memo(function Dock() {
 					);
 				});
 				if (found) {
-					matchedRunningKeys.add(appIdentity(found.path, found.executable, found.name));
+					matchedRunningKeys.add(itemKey(found));
 					return found;
 				}
 			}
@@ -1073,7 +1097,7 @@ const Dock = memo(function Dock() {
 		];
 
 		const unpinned = activeOrder
-			.map((id) => activeApps.find((a) => appIdentity(a.path, a.executable, a.name) === id))
+			.map((id) => activeApps.find((a) => itemKey(a) === id))
 			.filter(
 				(a): a is AppInfo =>
 					!!a && (dockShowBackgroundApps || !a.is_background) && !matchedRunningKeys.has(itemKey(a))

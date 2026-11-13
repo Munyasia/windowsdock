@@ -3395,6 +3395,7 @@ pub fn trigger_app_scan() {
                                                 hwnd: None,
                                                 executable,
                                                 all_hwnds: None,
+                                                profile: None,
                                             });
                                         }
                                         ILFree(Some(absolute_pidl as *const _));
@@ -3548,6 +3549,7 @@ fn collect_shortcuts(dir: &std::path::Path, apps: &mut Vec<AppInfo>, depth: i32)
                         hwnd: None,
                         executable,
                         all_hwnds: None,
+                        profile: None,
                     });
                 }
             }
@@ -4133,6 +4135,21 @@ pub unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> B
                             .as_deref()
                             .map_or(false, crate::commands::is_browser_pwa_aumid);
 
+                    // A regular browser window of a multi-profile browser
+                    // belongs to one profile, and each profile is its own dock
+                    // item ("Google Chrome (Work)"), as on the taskbar. Web app
+                    // windows and windows without an id are left alone.
+                    let browser_profile =
+                        if is_browser_host && !is_browser_pwa && window_aumid.is_some() {
+                            crate::commands::browser_profile(
+                                window_aumid.as_deref(),
+                                crate::utils::get_window_relaunch_command(hwnd).as_deref(),
+                                crate::utils::get_window_relaunch_display_name(hwnd).as_deref(),
+                            )
+                        } else {
+                            None
+                        };
+
                     let final_name = if ((is_browser_host
                         && (is_browser_pwa || window_aumid.is_none()))
                         || name == "ApplicationFrameHost"
@@ -4151,7 +4168,14 @@ pub unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> B
                     } else {
                         // The Start menu name ("WhatsApp", "LocalSend") rather than
                         // the executable's ("WhatsApp.Root", "localsend_app").
-                        crate::commands::app_display_name(&path, window_aumid.as_deref())
+                        let app_name =
+                            crate::commands::app_display_name(&path, window_aumid.as_deref());
+                        match browser_profile.as_ref() {
+                            Some(profile) => {
+                                crate::commands::browser_profile_item_name(&app_name, profile)
+                            }
+                            None => app_name,
+                        }
                     };
 
                     // Only avoid adding the exact same window handle (HWND) multiple times
@@ -4180,6 +4204,7 @@ pub unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> B
                             hwnd: Some(hwnd.0 as isize),
                             executable: exe_name,
                             all_hwnds: None,
+                            profile: browser_profile.map(|profile| profile.dir),
                         });
                     }
                 }
@@ -4203,6 +4228,7 @@ pub unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> B
                         hwnd: Some(hwnd.0 as isize),
                         executable: Some("consent.exe".into()),
                         all_hwnds: None,
+                        profile: None,
                     });
                 }
             }

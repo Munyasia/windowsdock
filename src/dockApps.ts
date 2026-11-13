@@ -12,6 +12,22 @@ export interface AppInfo {
 	// A pin keeps its display name, but its icon is cached under the live name.
 	icon_name?: string;
 	icon_path?: string;
+	// Browser profile directory ("Default", "Profile 1") of a regular
+	// Chrome/Edge/Brave window while the browser has several profiles.
+	profile?: string;
+}
+
+// Windows gives a browser's Default profile the browser's own AppUserModelID,
+// the one its pinned shortcut carries, and every other profile an id of its
+// own. So an item without a profile (a plain browser pin, a single-profile
+// browser, a web app) stands for the Default profile, and fuzzy matching must
+// never join two different profiles.
+export function sameBrowserProfile(
+	a: Pick<AppInfo, "profile">,
+	b: Pick<AppInfo, "profile">
+): boolean {
+	const profileOf = (app: Pick<AppInfo, "profile">) => (app.profile ?? "Default").toLowerCase();
+	return profileOf(a) === profileOf(b);
 }
 
 export interface TrayApp {
