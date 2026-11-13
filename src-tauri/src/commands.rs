@@ -1313,37 +1313,6 @@ pub(crate) fn icon_resource_file(resource: &str) -> Option<String> {
     (!file.is_empty()).then(|| file.to_string())
 }
 
-/// The badged profile icon Chromium writes into a profile folder once there
-/// are several profiles (`Google Profile.ico`, `Edge Profile.ico`, ...). Used
-/// for a pinned profile with no window to read the icon from.
-fn browser_profile_icon_file(exe_path: &str, profile_dir: &str) -> Option<String> {
-    browser_profile_args(profile_dir)?;
-    let exe = exe_path.to_lowercase();
-    let user_data = if exe.contains("msedge.exe") {
-        "Microsoft\\Edge\\User Data"
-    } else if exe.contains("brave.exe") {
-        "BraveSoftware\\Brave-Browser\\User Data"
-    } else if exe.contains("chrome.exe") {
-        "Google\\Chrome\\User Data"
-    } else {
-        return None;
-    };
-    let local = std::env::var("LOCALAPPDATA").ok()?;
-    let dir = std::path::Path::new(&local)
-        .join(user_data)
-        .join(profile_dir.trim());
-    std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.to_lowercase().ends_with(" profile.ico"))
-        })
-        .map(|path| path.to_string_lossy().into_owned())
-}
-
 /// Opens a new window of a Chromium browser in one profile. False when the
 /// target is not such a browser or the profile name is unusable, so the
 /// caller can fall back to a plain launch.
@@ -1488,6 +1457,17 @@ fn is_browser_host_process(path: &str) -> bool {
 /// Resolves the icon of a shell application id (Store/UWP/packaged PWA) through
 /// `shell:AppsFolder`. `SHGetFileInfoW` cannot handle these; `IShellItemImageFactory` can.
 fn icon_from_aumid(aumid: &str) -> Option<String> {
+    let id = aumid.trim().trim_start_matches("shell:AppsFolder\\");
+    if id.is_empty() {
+        return None;
+    }
+    shell_item_icon(&format!("shell:AppsFolder\\{}", id))
+}
+
+/// An item's icon at up to 256px through the shell (`IShellItemImageFactory`),
+/// for shell application ids (`shell:AppsFolder\...`) and files alike.
+/// `SHGetFileInfoW` stops at 32px and can't resolve application ids.
+fn shell_item_icon(parsing_name: &str) -> Option<String> {
     unsafe {
         use windows::Win32::Foundation::SIZE;
         use windows::Win32::UI::Shell::{
@@ -1495,12 +1475,6 @@ fn icon_from_aumid(aumid: &str) -> Option<String> {
             SIIGBF_ICONONLY,
         };
 
-        let id = aumid.trim().trim_start_matches("shell:AppsFolder\\");
-        if id.is_empty() {
-            return None;
-        }
-
-        let parsing_name = format!("shell:AppsFolder\\{}", id);
         let wide: Vec<u16> = parsing_name
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -1922,6 +1896,36 @@ pub async fn get_app_icon(
         }
     }
 
+    // A browser profile item: the browser's logo with the profile's avatar
+    // badged bottom-right (see profile_icon.rs). Built on every request,
+    // ahead of the icon cache and never stored in it: the cache key is the
+    // item's name, so an entry made by a request without the profile, or
+    // before the avatar changed, would keep serving a stale icon. The dock
+    // asks once per item per session. Only regular windows of a multi-profile
+    // browser carry a profile; single-profile browsers and web apps skip this.
+    if let Some(profile) = profile.filter(|_| is_chromium_browser(&path.to_lowercase())) {
+        let exe = path.clone();
+        let icon = tauri::async_runtime::spawn_blocking(move || {
+            use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+            let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
+            let window_icon = hwnd
+                .and_then(|h| crate::utils::get_window_relaunch_icon(HWND(h as *mut _)))
+                .and_then(|resource| icon_resource_file(&resource));
+            let logo = shell_item_icon(&exe)
+                .and_then(|uri| crate::profile_icon::image_from_data_uri(&uri));
+            if com {
+                unsafe { CoUninitialize() };
+            }
+            crate::profile_icon::profile_dock_icon(logo, &exe, &profile, window_icon.as_deref())
+                .and_then(|icon| crate::profile_icon::png_data_uri(&icon))
+        })
+        .await
+        .unwrap_or(None);
+        if icon.is_some() {
+            return Ok(icon);
+        }
+    }
+
     let cache = ICON_CACHE.get_or_init(|| {
         let mut map = std::collections::HashMap::new();
         if let Ok(content) = std::fs::read_to_string(&cache_path) {
@@ -1986,46 +1990,6 @@ pub async fn get_app_icon(
                 windows::Win32::System::Com::CoUninitialize();
             }
             icon
-        })
-        .await
-        .unwrap_or(None);
-
-        if let Some(base64) = result {
-            if let Ok(mut c) = cache.lock() {
-                c.insert(cache_key.clone(), base64.clone());
-            }
-            schedule_icon_cache_save(app);
-            return Ok(Some(base64));
-        }
-    }
-
-    // Strategy 2b: A browser profile item shows the profile's badged icon, the
-    // one the taskbar shows: the window's relaunch icon, or for a pin with no
-    // window the icon file in the profile folder. Only regular browser windows
-    // carry a profile, so web apps keep their own icons below.
-    if let Some(profile) = profile.filter(|_| is_chromium_browser(&path.to_lowercase())) {
-        let path_owned = path.clone();
-        let result = tauri::async_runtime::spawn_blocking(move || {
-            let window_icon = hwnd.and_then(|h| {
-                let com = unsafe {
-                    windows::Win32::System::Com::CoInitializeEx(
-                        None,
-                        windows::Win32::System::Com::COINIT_MULTITHREADED,
-                    )
-                    .is_ok()
-                };
-                let resource = crate::utils::get_window_relaunch_icon(HWND(h as *mut _));
-                if com {
-                    unsafe { windows::Win32::System::Com::CoUninitialize() };
-                }
-                resource.as_deref().and_then(icon_resource_file)
-            });
-            window_icon
-                .and_then(|file| image_file_to_base64(&file))
-                .or_else(|| {
-                    browser_profile_icon_file(&path_owned, &profile)
-                        .and_then(|file| image_file_to_base64(&file))
-                })
         })
         .await
         .unwrap_or(None);

@@ -7,6 +7,7 @@ mod commands;
 mod diagnostics;
 mod dock_extras;
 mod jack;
+mod profile_icon;
 mod services;
 mod settings_window;
 mod shelf;
