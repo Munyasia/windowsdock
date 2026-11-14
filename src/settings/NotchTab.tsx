@@ -314,8 +314,8 @@ export function NotchTab({
 
 						<SettingRow
 							icon={Sparkles}
-							label="Ambient Glow"
-							desc="Colored glow behind expanded album art"
+							label="Album Art Background"
+							desc="Show the song's cover behind the open player"
 						>
 							<label className="toggle-switch">
 								<input type="checkbox" checked={mediaAmbienceEnabled} onChange={toggleAmbience} />

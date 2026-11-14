@@ -1,4 +1,4 @@
-import { motion, AnimatePresence, useAnimation } from "framer-motion";
+import { motion, AnimatePresence, useAnimation, useReducedMotion } from "framer-motion";
 import { useEffect, useLayoutEffect, useState, useCallback, useMemo, useRef, memo } from "react";
 import { emitTo, listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
@@ -502,6 +502,7 @@ function App() {
 	}, []);
 
 	const [time, setTime] = useState("");
+	const reduceMotion = useReducedMotion();
 	const [notchDate, setNotchDate] = useState(() => formatNotchDate(new Date()));
 	// Measured each render, since the month name changes the date's width.
 	const [notchDateWidth, setNotchDateWidth] = useState(62);
@@ -2810,6 +2811,9 @@ function App() {
 	};
 
 	const isCalendarMode = bloomMode === "calendar";
+	// The open player's cover backdrop (the Album Art Background setting).
+	const showArtBackdrop =
+		isMusicMode && settingsAmbienceEnabled && !!albumArtUrl && isOpen && !isCalendarMode;
 	// Arrows switch between the two tool panels; wheel/swipe can also open one
 	// directly from the collapsed pill or a live activity.
 	const showPanelArrows =
@@ -2885,7 +2889,7 @@ function App() {
 				<DeviceArtDefs />
 				<motion.div
 					ref={bloomRef}
-					className={`bloom ${isHovered ? "expanded" : ""} ${isImpacted ? "is-impacted" : ""} ${isDragHovering ? "drag-hover" : ""}`}
+					className={`bloom ${isHovered ? "expanded" : ""} ${isImpacted ? "is-impacted" : ""} ${isDragHovering ? "drag-hover" : ""}${showArtBackdrop ? " has-art-backdrop" : ""}`}
 					onMouseEnter={() => setIsNotchHovered(true)}
 					onMouseLeave={() => setIsNotchHovered(false)}
 					onWheel={handleWheel}
@@ -2941,24 +2945,26 @@ function App() {
 				>
 					<EdgeSurface edge="top" flares={isImpacted} reflective={edgeShineEnabled} resolutionScale={scale} />
 					<AnimatePresence>
-						{isMusicMode && settingsAmbienceEnabled && albumArtUrl && isOpen && !isCalendarMode && (
+						{/* The open player sits on the song's cover. Covers stack so a track
+						    change cross-fades instead of flashing the plain notch. */}
+						{showArtBackdrop && (
 							<motion.div
-								className="notch-ambient-glow"
+								className="notch-art-backdrop"
 								initial={{ opacity: 0 }}
 								animate={{ opacity: 1 }}
 								exit={{ opacity: 0 }}
-								transition={{ duration: 0.15 }}
+								transition={{ duration: 0.2 }}
 							>
-								<AnimatePresence mode="wait">
+								<AnimatePresence initial={false}>
 									<motion.img
 										key={albumArtUrl}
 										src={albumArtUrl}
 										alt=""
 										draggable={false}
-										initial={{ opacity: 0, scale: 1.1 }}
-										animate={{ opacity: 1, scale: 1.8 }}
+										initial={{ opacity: 0, scale: reduceMotion ? 1 : 1.04 }}
+										animate={{ opacity: 1, scale: 1 }}
 										exit={{ opacity: 0 }}
-										transition={{ duration: 0.3 }}
+										transition={{ duration: 0.45, ease: [0.22, 1, 0.36, 1] }}
 									/>
 								</AnimatePresence>
 							</motion.div>

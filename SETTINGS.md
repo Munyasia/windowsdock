@@ -84,7 +84,7 @@ Edit `settings.json` with any text editor while Bloom is running. Changes are ap
 | Key                                | Type                      | Default     | Description                                                                                     |
 | ---------------------------------- | ------------------------- | ----------- | ----------------------------------------------------------------------------------------------- |
 | `bloom-media-layout`               | `"classic"` / `"compact"` | `"classic"` | Expanded player style. **classic** = large album art. **compact** = small thumbnail + controls. |
-| `bloom-media-ambience-enabled`     | `"true"` / `"false"`      | `"true"`    | Colored ambient glow behind expanded album art.                                                 |
+| `bloom-media-ambience-enabled`     | `"true"` / `"false"`      | `"true"`    | Show the song's cover behind the open music player, dimmed so the controls stay readable.      |
 | `bloom-media-compact-glow-enabled` | `"true"` / `"false"`      | `"true"`    | Glow effect around the collapsed compact thumbnail.                                             |
 | `bloom-media-visualizer-enabled`   | `"true"` / `"false"`      | `"true"`    | Audio visualizer bars in music mode. Also accepts `bloom-visualizer-enabled` (legacy alias).    |
 | `bloom-media-album-art-enabled`    | `"true"` / `"false"`      | `"true"`    | Show album artwork in the notch music display.                                                  |

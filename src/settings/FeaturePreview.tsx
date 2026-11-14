@@ -514,7 +514,7 @@ export function FeaturePreview({ tab, settings, focus }: FeaturePreviewProps) {
 				"Music Mode": "music",
 				"Compact Mode": "music",
 				"Media Layout": "music",
-				"Ambient Glow": "music",
+				"Album Art Background": "music",
 				"Compact Glow": "music"
 			},
 			dock: {
