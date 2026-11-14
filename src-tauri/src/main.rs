@@ -43,13 +43,24 @@ unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> BOOL {
 
 fn main() {
     let mut args = std::env::args_os();
-    if args.nth(1).as_deref() == Some(std::ffi::OsStr::new("--taskbar-watchdog")) {
+    let mode = args.nth(1);
+    if mode.as_deref() == Some(std::ffi::OsStr::new("--taskbar-watchdog")) {
         if let (Some(pid), Some(marker)) = (args.next(), args.next()) {
             if let Ok(pid) = pid.to_string_lossy().parse::<u32>() {
                 utils::run_taskbar_watchdog(pid, marker.into());
             }
         }
         return;
+    }
+    // Starts the watchdog outside the dock's process tree, then exits.
+    if mode.as_deref() == Some(std::ffi::OsStr::new("--taskbar-watchdog-launch")) {
+        let started = match (args.next(), args.next()) {
+            (Some(pid), Some(marker)) => {
+                utils::spawn_detached_taskbar_watchdog(&pid, &marker).is_ok()
+            }
+            _ => false,
+        };
+        std::process::exit(if started { 0 } else { 1 });
     }
     unsafe {
         let _ = SetConsoleCtrlHandler(Some(ctrl_handler), true);

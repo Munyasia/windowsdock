@@ -73,6 +73,13 @@ pub fn init_taskbar_marker(app: &tauri::AppHandle) {
 
 /// A separate Bloom process restores Explorer's taskbar when this process is
 /// terminated without running Tauri's exit handlers.
+///
+/// The watchdog is started through a short-lived launcher process
+/// (`--taskbar-watchdog-launch`) so that it is not a descendant of this
+/// process. Ending this process's tree (Task Manager's End process tree, or a
+/// terminal or tool that kills everything it started) used to take the
+/// watchdog down with the dock and leave the taskbar hidden. The launcher's
+/// exit code says whether the watchdog started.
 pub fn start_taskbar_watchdog() -> std::io::Result<()> {
     let mut started = TASKBAR_WATCHDOG_STARTED
         .lock()
@@ -89,13 +96,53 @@ pub fn start_taskbar_watchdog() -> std::io::Result<()> {
     if let Some(dir) = marker.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::process::Command::new(std::env::current_exe()?)
-        .arg("--taskbar-watchdog")
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let launched = std::process::Command::new(std::env::current_exe()?)
+        .arg("--taskbar-watchdog-launch")
         .arg(std::process::id().to_string())
         .arg(marker)
-        .spawn()?;
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()?;
+    if !launched.success() {
+        return Err(std::io::Error::other("taskbar watchdog did not start"));
+    }
     *started = true;
     Ok(())
+}
+
+/// Runs in the launcher process: starts the watchdog detached, so once the
+/// launcher exits the watchdog has no living parent and no process-tree kill
+/// of the dock reaches it. It also leaves the dock's job object where the job
+/// allows that; a job that forbids it refuses the flag, and the watchdog
+/// then stays in the job, as before.
+pub fn spawn_detached_taskbar_watchdog(
+    parent_pid: &std::ffi::OsStr,
+    marker: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    let exe = std::env::current_exe()?;
+    let spawn = |flags: u32| {
+        std::process::Command::new(&exe)
+            .arg("--taskbar-watchdog")
+            .arg(parent_pid)
+            .arg(marker)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(flags)
+            .spawn()
+    };
+    let detached = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    spawn(detached | CREATE_BREAKAWAY_FROM_JOB)
+        .or_else(|_| spawn(detached))
+        .map(|_| ())
 }
 
 pub fn run_taskbar_watchdog(parent_pid: u32, marker: PathBuf) {
