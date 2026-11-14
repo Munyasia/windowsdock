@@ -1,4 +1,13 @@
-import { useState, useEffect, useLayoutEffect, useMemo, useRef, memo } from "react";
+import {
+	useState,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useReducer,
+	useRef,
+	memo,
+	type ReactNode
+} from "react";
 import { motion, AnimatePresence, Reorder } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -153,6 +162,48 @@ const ITEM_INITIAL = { opacity: 0, scale: 0 };
 const ITEM_ANIMATE = { opacity: 1, scale: 1 };
 const ITEM_EXIT = { opacity: 0, scale: 0 };
 
+// Reorder value for the divider between pinned and running icons. No
+// itemKey can contain a NUL, so it never collides with an app.
+const PIN_DIVIDER = "\0pin-divider";
+
+// A pin keeps the app's identity but none of its running window state.
+const toPin = (app: AppInfo): AppInfo => ({
+	...app,
+	is_pinned: true,
+	is_running: false,
+	hwnd: undefined
+});
+
+// Reorder.Group ignores further moves after proposing an order until it
+// renders again. A refused proposal changes no dock state, so this re-renders
+// just the group (its children bail out) to keep the drag responsive.
+function DockReorderGroup({
+	values,
+	onReorder,
+	className,
+	children
+}: {
+	values: string[];
+	onReorder: (next: string[]) => boolean;
+	className?: string;
+	children: ReactNode;
+}) {
+	const [, rearm] = useReducer((n: number) => n + 1, 0);
+	return (
+		<Reorder.Group
+			as="div"
+			axis="x"
+			values={values}
+			className={className}
+			onReorder={(next: string[]) => {
+				if (!onReorder(next)) rearm();
+			}}
+		>
+			{children}
+		</Reorder.Group>
+	);
+}
+
 // One dot per open window, capped at three.
 function WindowDots({ count, background }: { count: number; background?: boolean }) {
 	return (
@@ -236,7 +287,13 @@ const Dock = memo(function Dock() {
 	const [activeSubmenu, setActiveSubmenu] = useState<string | null>(null);
 	const [activeOrder, setActiveOrder] = useState<string[]>([]);
 	const observedTrayPathsRef = useRef(new Set<string>());
-	const [isDragging, setIsDragging] = useState(false);
+	// The icon being dragged, and the order it has produced so far (pinned keys,
+	// PIN_DIVIDER, running keys). Nothing is saved until the drop.
+	const [draggingKey, setDraggingKey] = useState<string | null>(null);
+	const isDragging = draggingKey !== null;
+	const [dragOrder, setDragOrder] = useState<string[] | null>(null);
+	const dragOrderRef = useRef<string[] | null>(null);
+	const dragMovedRef = useRef(false);
 	const [hoveredApp, setHoveredApp] = useState<string | null>(null);
 	const [pressedApp, setPressedApp] = useState<string | null>(null);
 	const [isReady, setIsReady] = useState(false);
@@ -765,7 +822,7 @@ const Dock = memo(function Dock() {
 			// Fuzzy guard: the same app pinned via another entry shape (running
 			// window vs installed shortcut) must never create a duplicate.
 			if (pinnedApps.some((a) => isSameApp(a, app))) return;
-			newPinned = [...pinnedApps, { ...app, is_pinned: true, is_running: false, hwnd: undefined }];
+			newPinned = [...pinnedApps, toPin(app)];
 			fetchIcon(app.path, app.name, undefined, app.profile);
 		}
 		setPinnedApps(newPinned);
@@ -1165,22 +1222,81 @@ const Dock = memo(function Dock() {
 		};
 	}, []);
 
+	// Pinned and running icons share one reorder list, split by PIN_DIVIDER.
 	// Items are keyed by identity, not path: web apps running in the same
 	// browser share one executable path.
-	const handleReorder = (newKeys: string[]) => {
-		const oldKeys = pinnedApps.map(itemKey);
-		if (JSON.stringify(newKeys) !== JSON.stringify(oldKeys)) {
-			const reordered = newKeys
-				.map((key) => pinnedApps.find((p) => itemKey(p) === key))
-				.filter((p): p is AppInfo => !!p);
-			setPinnedApps(reordered);
+	const appsByKey = useMemo(
+		() => new Map([...pinnedItems, ...unpinnedItems].map((app) => [itemKey(app), app])),
+		[pinnedItems, unpinnedItems]
+	);
+	const dockOrder = useMemo(() => {
+		const keys = pinnedItems.map(itemKey);
+		if (unpinnedItems.length > 0) keys.push(PIN_DIVIDER, ...unpinnedItems.map(itemKey));
+		return keys;
+	}, [pinnedItems, unpinnedItems]);
+	const shownOrder = useMemo(
+		() => (dragOrder ?? dockOrder).filter((key) => key === PIN_DIVIDER || appsByKey.has(key)),
+		[dragOrder, dockOrder, appsByKey]
+	);
+
+	// Pinned icons stay left of the divider. A running app may cross it, which
+	// pins it when dropped there.
+	const handleReorder = (next: string[]): boolean => {
+		const divider = next.indexOf(PIN_DIVIDER);
+		if (divider !== -1 && next.slice(divider + 1).some((key) => appsByKey.get(key)?.is_pinned)) {
+			return false;
 		}
+		dragOrderRef.current = next;
+		setDragOrder(next);
+		return true;
+	};
+
+	const applyDockOrder = (order: string[]) => {
+		const divider = order.indexOf(PIN_DIVIDER);
+		const pinnedSide = divider === -1 ? order : order.slice(0, divider);
+		const runningSide = divider === -1 ? [] : order.slice(divider + 1);
+
+		const nextPinned: AppInfo[] = [];
+		for (const key of pinnedSide) {
+			const pin = pinnedApps.find((p) => itemKey(p) === key);
+			if (pin) {
+				nextPinned.push(pin);
+				continue;
+			}
+			// A running app dropped on the pinned side. Same duplicate guard as
+			// togglePin: another entry shape of the same app must not pin twice.
+			const app = appsByKey.get(key);
+			if (app && !pinnedApps.some((p) => isSameApp(p, app))) {
+				nextPinned.push(toPin(app));
+				fetchIcon(app.path, app.name, undefined, app.profile);
+			}
+		}
+		// A pin the drag never saw (renamed mid-drag) is kept, at the end.
+		pinnedApps.forEach((p) => {
+			if (!nextPinned.includes(p)) nextPinned.push(p);
+		});
+		if (nextPinned.length !== pinnedApps.length || nextPinned.some((p, i) => p !== pinnedApps[i])) {
+			setPinnedApps(nextPinned);
+			invoke("save_pinned_apps", { apps: nextPinned }).catch(console.error);
+		}
+
+		// Running apps keep the dragged order until they close. Only the slots
+		// they hold are reassigned, so hidden background apps keep theirs.
+		const moved = new Set(runningSide);
+		setActiveOrder((prev) => {
+			let i = 0;
+			const next = prev.map((key) => (moved.has(key) ? (runningSide[i++] ?? key) : key));
+			return next.every((key, j) => key === prev[j]) ? prev : next;
+		});
 	};
 
 	const handleDragEnd = () => {
-		setIsDragging(false);
+		const order = dragOrderRef.current;
+		dragOrderRef.current = null;
+		setDragOrder(null);
+		setDraggingKey(null);
 		setPressedApp(null);
-		invoke("save_pinned_apps", { apps: pinnedApps }).catch(console.error);
+		if (order) applyDockOrder(order);
 	};
 
 	useEffect(() => {
@@ -1262,10 +1378,11 @@ const Dock = memo(function Dock() {
 	}, [hoveredApp, isDragging, dockItems]);
 
 	const iconVariants = {
-		idle: { y: 0, scale: 1 },
-		hover: { y: -5, scale: 1.1 },
+		// Opacity is explicit everywhere so a dropped icon fades back from "drag".
+		idle: { y: 0, scale: 1, opacity: 1 },
+		hover: { y: -5, scale: 1.1, opacity: 1 },
 		drag: { y: -10, scale: 1.1, opacity: 0.8 },
-		tap: { scale: 0.95 }
+		tap: { scale: 0.95, opacity: 1 }
 	};
 
 	const renderExtra = (extra: DockExtra) => (
@@ -1483,327 +1600,202 @@ const Dock = memo(function Dock() {
 									</>
 								)}
 
-								<Reorder.Group
-									as="div"
-									axis="x"
-									values={pinnedItems.map(itemKey)}
+								<DockReorderGroup
+									values={shownOrder}
 									onReorder={handleReorder}
 									className="dock-reorder-group"
 								>
-									{pinnedItems.map((app) => (
-										<Reorder.Item
-											as="div"
-											key={itemKey(app)}
-											value={itemKey(app)}
-											style={{ position: "relative" }}
-											onDragStart={() => {
-												setIsDragging(true);
-												setHoveredApp(null);
-												setPressedApp(null);
-											}}
-											onDragEnd={handleDragEnd}
-											onContextMenu={(e) => handleContextMenu(e, app)}
-											onMouseDown={(e) => {
-												if (e.button === 1) e.preventDefault();
-											}}
-											onAuxClick={(e) => handleMiddleClick(e, app)}
-											onClick={(e) => {
-												e.stopPropagation();
-												if (!isDragging) handleAppClick(app);
-											}}
-										>
-											<motion.div
-												className="dock-icon-wrapper"
-												initial={ITEM_INITIAL}
-												animate={ITEM_ANIMATE}
-												exit={ITEM_EXIT}
-												transition={ITEM_ENTRY_TRANSITION}
-												onMouseEnter={() => setHoveredApp(itemKey(app))}
-												onMouseLeave={() => {
-													if (!isPreviewHoveredRef.current) {
-														setHoveredApp(null);
-														setPressedApp(null);
-													}
+									{shownOrder.map((key) => {
+										if (key === PIN_DIVIDER) {
+											// A reorder item so icons can be dragged across it. Hidden
+											// by the setting, it still marks where pinning starts.
+											return (
+												<Reorder.Item
+													as="div"
+													key={key}
+													value={key}
+													dragListener={false}
+													className={`dock-app-divider${dockSeparatorEnabled ? "" : " dock-app-divider-hidden"}`}
+													role="separator"
+													aria-orientation="vertical"
+													aria-hidden={!dockSeparatorEnabled}
+												/>
+											);
+										}
+										const app = appsByKey.get(key);
+										if (!app) return null;
+										const pinHint =
+											!app.is_pinned &&
+											draggingKey === key &&
+											dragOrder !== null &&
+											dragOrder.indexOf(key) < dragOrder.indexOf(PIN_DIVIDER);
+										return (
+											<Reorder.Item
+												as="div"
+												key={key}
+												value={key}
+												style={{ position: "relative" }}
+												onPointerDown={() => {
+													dragMovedRef.current = false;
+												}}
+												onDragStart={() => {
+													dragMovedRef.current = true;
+													setDraggingKey(key);
+													setHoveredApp(null);
+													setPressedApp(null);
+												}}
+												onDragEnd={handleDragEnd}
+												onContextMenu={(e) => handleContextMenu(e, app)}
+												onMouseDown={(e) => {
+													if (e.button === 1) e.preventDefault();
+												}}
+												onAuxClick={(e) => handleMiddleClick(e, app)}
+												onClick={(e) => {
+													e.stopPropagation();
+													// Dropping a dragged icon must not also open or focus it.
+													if (!dragMovedRef.current) handleAppClick(app);
 												}}
 											>
-												<AnimatePresence>
-													{dockPreviewEnabled &&
-														previewData &&
-														previewData.id === itemKey(app) &&
-														hoveredApp === itemKey(app) && (
-															<motion.div
-																className={`preview-tooltip ${previewData.previews.length > 1 ? "multi" : ""}`}
-																initial={{ opacity: 0, y: 10, scale: 0.95 }}
-																animate={{ opacity: 1, y: 0, scale: 1 }}
-																exit={{ opacity: 0, scale: 0.95 }}
-																transition={{ duration: 0.15 }}
-																onMouseEnter={() => {
-																	isPreviewHoveredRef.current = true;
-																}}
-																onMouseLeave={() => {
-																	isPreviewHoveredRef.current = false;
-																	setHoveredApp(null);
-																	setPressedApp(null);
-																}}
-															>
-																<div className="preview-items">
-																	{previewData.previews.map((prev, idx) => (
-																		<div
-																			key={prev.hwnd}
-																			className="preview-item"
-																			onClick={() => invoke("focus_window", { hwnd: prev.hwnd })}
-																		>
-																			<img src={prev.image} alt={`Preview ${idx}`} />
-																			<div className="preview-label">{prev.title || app.name}</div>
-																			<button
-																				className="preview-close-btn"
-																				onClick={(e) => handleClosePreview(e, prev.hwnd)}
-																				title="Close Window"
-																			>
-																				<svg
-																					width="10"
-																					height="10"
-																					viewBox="0 0 24 24"
-																					fill="none"
-																					stroke="currentColor"
-																					strokeWidth="3"
-																					strokeLinecap="round"
-																				>
-																					<line x1="18" y1="6" x2="6" y2="18"></line>
-																					<line x1="6" y1="6" x2="18" y2="18"></line>
-																				</svg>
-																			</button>
-																		</div>
-																	))}
-																</div>
-															</motion.div>
-														)}
-												</AnimatePresence>
-
-												{/* Fallback to text tooltip if previews are disabled, app isn't running, or preview failed to load */}
-												{(!dockPreviewEnabled ||
-													(dockPreviewEnabled && hoveredApp === itemKey(app) && !previewData)) && (
-													<div className="tooltip">{app.name}</div>
-												)}
 												<motion.div
-													className="dock-icon"
-													variants={iconVariants}
-													animate={
-														pressedApp === itemKey(app)
-															? "tap"
-															: isDragging && !app.is_pinned
-																? "idle"
-																: hoveredApp === itemKey(app) && !isDragging
-																	? "hover"
-																	: "idle"
-													}
-													whileDrag="drag"
-													onPointerDown={() => setPressedApp(itemKey(app))}
-													onPointerUp={() => setPressedApp(null)}
-													onPointerCancel={() => setPressedApp(null)}
-												>
-													{(() => {
-														const isHost = isBrowserHost(app.path);
-														const cacheKey = isHost
-															? `${app.path}:${app.name.toLowerCase()}`
-															: app.hwnd
-																? `${app.path}-${app.hwnd}`
-																: app.path;
-														// Running host items must not use the shared path fallback: the
-														// browser and its PWAs share one path, so it would leak one item's
-														// icon onto the others.
-														const allowPathFallback = !isHost || !app.is_running;
-														const icon =
-															customIcons[cacheKey] ||
-															(allowPathFallback && customIcons[app.path]) ||
-															iconsRef.current[dockIconKey(app, isHost)] ||
-															iconsRef.current[cacheKey] ||
-															(allowPathFallback && iconsRef.current[app.path]) ||
-															app.icon;
-
-														const isBloomOrSettings =
-															app.name.toLowerCase() === "settings" ||
-															app.name.toLowerCase() === "bloom" ||
-															app.path.toLowerCase().includes("bloom.exe");
-
-														return icon ? (
-															<img
-																src={icon}
-																alt={app.name}
-																className={isBloomOrSettings ? "bloom-icon-img" : ""}
-																draggable={false}
-															/>
-														) : (
-															<div className="fallback-icon">{app.name[0]}</div>
-														);
-													})()}
-												</motion.div>
-												{app.is_running && (dockShowBackgroundApps || !app.is_background) && (
-													<WindowDots
-														count={app.all_hwnds?.length ?? 1}
-														background={app.is_background}
-													/>
-												)}
-											</motion.div>
-										</Reorder.Item>
-									))}
-								</Reorder.Group>
-
-								{dockSeparatorEnabled &&
-									unpinnedItems.length > 0 &&
-									(pinnedItems.length > 0 || startItem) && (
-										<div
-											className="dock-app-divider"
-											role="separator"
-											aria-orientation="vertical"
-										/>
-									)}
-
-								{unpinnedItems.map((app) => (
-									<motion.div
-										key={itemKey(app)}
-										layout
-										initial={{ opacity: 0, scale: 0 }}
-										animate={{
-											opacity: 1,
-											scale: 1,
-											transition: {
-												opacity: { duration: 0.15, delay: 0.15 },
-												scale: { type: "spring", stiffness: 400, damping: 25, delay: 0.15 }
-											}
-										}}
-										exit={{ opacity: 0, scale: 0, transition: { duration: 0.12 } }}
-										className="dock-icon-wrapper"
-										onContextMenu={(e) => handleContextMenu(e, app)}
-										onMouseEnter={() => setHoveredApp(itemKey(app))}
-										onMouseLeave={() => {
-											if (!isPreviewHoveredRef.current) {
-												setHoveredApp(null);
-												setPressedApp(null);
-											}
-										}}
-										onMouseDown={(e) => {
-											if (e.button === 1) e.preventDefault();
-										}}
-										onAuxClick={(e) => handleMiddleClick(e, app)}
-										onClick={(e) => {
-											e.stopPropagation();
-											handleAppClick(app);
-										}}
-									>
-										<AnimatePresence>
-											{dockPreviewEnabled &&
-												previewData &&
-												previewData.id === itemKey(app) &&
-												hoveredApp === itemKey(app) && (
-													<motion.div
-														className={`preview-tooltip ${previewData.previews.length > 1 ? "multi" : ""}`}
-														initial={{ opacity: 0, y: 10, scale: 0.95 }}
-														animate={{ opacity: 1, y: 0, scale: 1 }}
-														exit={{ opacity: 0, scale: 0.95 }}
-														transition={{ duration: 0.15 }}
-														onMouseEnter={() => {
-															isPreviewHoveredRef.current = true;
-														}}
-														onMouseLeave={() => {
-															isPreviewHoveredRef.current = false;
+													className="dock-icon-wrapper"
+													initial={ITEM_INITIAL}
+													animate={ITEM_ANIMATE}
+													exit={ITEM_EXIT}
+													transition={ITEM_ENTRY_TRANSITION}
+													onMouseEnter={() => setHoveredApp(key)}
+													onMouseLeave={() => {
+														if (!isPreviewHoveredRef.current) {
 															setHoveredApp(null);
 															setPressedApp(null);
-														}}
-													>
-														<div className="preview-items">
-															{previewData.previews.map((prev, idx) => (
-																<div
-																	key={prev.hwnd}
-																	className="preview-item"
-																	onClick={() => invoke("focus_window", { hwnd: prev.hwnd })}
+														}
+													}}
+												>
+													<AnimatePresence>
+														{dockPreviewEnabled &&
+															previewData &&
+															previewData.id === key &&
+															hoveredApp === key && (
+																<motion.div
+																	className={`preview-tooltip ${previewData.previews.length > 1 ? "multi" : ""}`}
+																	initial={{ opacity: 0, y: 10, scale: 0.95 }}
+																	animate={{ opacity: 1, y: 0, scale: 1 }}
+																	exit={{ opacity: 0, scale: 0.95 }}
+																	transition={{ duration: 0.15 }}
+																	onMouseEnter={() => {
+																		isPreviewHoveredRef.current = true;
+																	}}
+																	onMouseLeave={() => {
+																		isPreviewHoveredRef.current = false;
+																		setHoveredApp(null);
+																		setPressedApp(null);
+																	}}
 																>
-																	<img src={prev.image} alt={`Preview ${idx}`} />
-																	<div className="preview-label">{prev.title || app.name}</div>
-																	<button
-																		className="preview-close-btn"
-																		onClick={(e) => handleClosePreview(e, prev.hwnd)}
-																		title="Close Window"
-																	>
-																		<svg
-																			width="10"
-																			height="10"
-																			viewBox="0 0 24 24"
-																			fill="none"
-																			stroke="currentColor"
-																			strokeWidth="3"
-																			strokeLinecap="round"
-																		>
-																			<line x1="18" y1="6" x2="6" y2="18"></line>
-																			<line x1="6" y1="6" x2="18" y2="18"></line>
-																		</svg>
-																	</button>
-																</div>
-															))}
-														</div>
+																	<div className="preview-items">
+																		{previewData.previews.map((prev, idx) => (
+																			<div
+																				key={prev.hwnd}
+																				className="preview-item"
+																				onClick={() => invoke("focus_window", { hwnd: prev.hwnd })}
+																			>
+																				<img src={prev.image} alt={`Preview ${idx}`} />
+																				<div className="preview-label">{prev.title || app.name}</div>
+																				<button
+																					className="preview-close-btn"
+																					onClick={(e) => handleClosePreview(e, prev.hwnd)}
+																					title="Close Window"
+																				>
+																					<svg
+																						width="10"
+																						height="10"
+																						viewBox="0 0 24 24"
+																						fill="none"
+																						stroke="currentColor"
+																						strokeWidth="3"
+																						strokeLinecap="round"
+																					>
+																						<line x1="18" y1="6" x2="6" y2="18"></line>
+																						<line x1="6" y1="6" x2="18" y2="18"></line>
+																					</svg>
+																				</button>
+																			</div>
+																		))}
+																	</div>
+																</motion.div>
+															)}
+													</AnimatePresence>
+
+													{/* Fallback to text tooltip if previews are disabled, app isn't running, or preview failed to load */}
+													{pinHint ? (
+														<div className="tooltip drag-hint">Pin to Dock</div>
+													) : (
+														(!dockPreviewEnabled ||
+															(dockPreviewEnabled && hoveredApp === key && !previewData)) && (
+															<div className="tooltip">{app.name}</div>
+														)
+													)}
+													<motion.div
+														className="dock-icon"
+														variants={iconVariants}
+														animate={
+															draggingKey === key
+																? "drag"
+																: pressedApp === key
+																	? "tap"
+																	: hoveredApp === key && !isDragging
+																		? "hover"
+																		: "idle"
+														}
+														onPointerDown={() => setPressedApp(key)}
+														onPointerUp={() => setPressedApp(null)}
+														onPointerCancel={() => setPressedApp(null)}
+													>
+														{(() => {
+															const isHost = isBrowserHost(app.path);
+															const cacheKey = isHost
+																? `${app.path}:${app.name.toLowerCase()}`
+																: app.hwnd
+																	? `${app.path}-${app.hwnd}`
+																	: app.path;
+															// Running host items must not use the shared path fallback: the
+															// browser and its PWAs share one path, so it would leak one item's
+															// icon onto the others.
+															const allowPathFallback = !isHost || !app.is_running;
+															const icon =
+																customIcons[cacheKey] ||
+																(allowPathFallback && customIcons[app.path]) ||
+																iconsRef.current[dockIconKey(app, isHost)] ||
+																iconsRef.current[cacheKey] ||
+																(allowPathFallback && iconsRef.current[app.path]) ||
+																app.icon;
+
+															const isBloomOrSettings =
+																app.name.toLowerCase() === "settings" ||
+																app.name.toLowerCase() === "bloom" ||
+																app.path.toLowerCase().includes("bloom.exe");
+
+															return icon ? (
+																<img
+																	src={icon}
+																	alt={app.name}
+																	className={isBloomOrSettings ? "bloom-icon-img" : ""}
+																	draggable={false}
+																/>
+															) : (
+																<div className="fallback-icon">{app.name[0]}</div>
+															);
+														})()}
 													</motion.div>
-												)}
-										</AnimatePresence>
-										{(!dockPreviewEnabled ||
-											(dockPreviewEnabled && hoveredApp === itemKey(app) && !previewData)) && (
-											<div className="tooltip">{app.name}</div>
-										)}
-										<motion.div
-											className="dock-icon"
-											variants={iconVariants}
-											animate={
-												pressedApp === itemKey(app)
-													? "tap"
-													: hoveredApp === itemKey(app) && !isDragging
-														? "hover"
-														: "idle"
-											}
-											onPointerDown={() => setPressedApp(itemKey(app))}
-											onPointerUp={() => setPressedApp(null)}
-											onPointerCancel={() => setPressedApp(null)}
-										>
-											{(() => {
-												const isHost = isBrowserHost(app.path);
-												const cacheKey = isHost
-													? `${app.path}:${app.name.toLowerCase()}`
-													: app.hwnd
-														? `${app.path}-${app.hwnd}`
-														: app.path;
-												// Running host items must not use the shared path fallback: the
-												// browser and its PWAs share one path, so it would leak one item's
-												// icon onto the others.
-												const allowPathFallback = !isHost || !app.is_running;
-												const icon =
-													customIcons[cacheKey] ||
-													(allowPathFallback && customIcons[app.path]) ||
-													iconsRef.current[dockIconKey(app, isHost)] ||
-													iconsRef.current[cacheKey] ||
-													(allowPathFallback && iconsRef.current[app.path]) ||
-													app.icon;
-												const isBloomOrSettings =
-													app.name.toLowerCase() === "settings" ||
-													app.name.toLowerCase() === "bloom" ||
-													app.path.toLowerCase().includes("bloom.exe");
-												return icon ? (
-													<img
-														src={icon}
-														alt={app.name}
-														className={isBloomOrSettings ? "bloom-icon-img" : ""}
-														draggable={false}
-													/>
-												) : (
-													<div className="fallback-icon">{app.name[0]}</div>
-												);
-											})()}
-										</motion.div>
-										{app.is_running && (
-											<WindowDots
-												count={app.all_hwnds?.length ?? 1}
-												background={app.is_background}
-											/>
-										)}
-									</motion.div>
-								))}
+													{app.is_running && (dockShowBackgroundApps || !app.is_background) && (
+														<WindowDots
+															count={app.all_hwnds?.length ?? 1}
+															background={app.is_background}
+														/>
+													)}
+												</motion.div>
+											</Reorder.Item>
+										);
+									})}
+								</DockReorderGroup>
 
 								{dockExtrasPosition === "right" && dockExtras.length > 0 && (
 									<>

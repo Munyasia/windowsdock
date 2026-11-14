@@ -81,6 +81,7 @@ Bloom replaces your native Windows taskbar.
 It sits at the bottom of your screen, always there when you need it.
 
 Drag to reorder.
+Drag an open app over to your pinned apps to pin it.
 Hover for window previews.
 Right-click for context menus.
 

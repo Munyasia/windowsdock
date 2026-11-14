@@ -46,6 +46,14 @@ body {
 	transform: translate(-50%, 0) scale(1);
 }
 
+/* A running app dragged onto the pinned side. Sits higher than the name
+   tooltip to clear the lifted icon. */
+.dock-container.dragging .tooltip.drag-hint {
+	top: -42px;
+	opacity: 1;
+	transform: translate(-50%, 0) scale(1);
+}
+
 .tooltip.tooltip-hidden {
 	opacity: 0 !important;
 	transition: opacity 0.1s ease !important;
@@ -248,6 +256,14 @@ body {
 	border-radius: 1px;
 	background: color-mix(in srgb, var(--bloom-text, white) 24%, transparent);
 	pointer-events: none;
+}
+
+/* With the separator setting off the divider still marks where pinning
+   starts. The negative margins cancel the extra flex gap it would add. */
+.dock-app-divider-hidden {
+	width: 0;
+	margin: 0 -6px;
+	background: none;
 }
 
 .dock-icon-wrapper {
