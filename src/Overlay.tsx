@@ -632,14 +632,26 @@ function OverlayApp() {
 	const hideWindowTimeoutRef = useRef<any>(null);
 	const splashActiveRef = useRef(false);
 	const mixerExpandedRef = useRef(false);
+	// Whether the cursor is in a side's space (edge band, card, open mixer), as
+	// the backend reports it. A hovered card stays until the cursor leaves.
+	const volumeHoverRef = useRef(false);
+	const brightnessHoverRef = useRef(false);
 
 	const resetHideTimeout = useCallback(() => {
 		// Keep the notch pinned while the mixer panel is open; it closes on
-		// mouse leave via the edge-hover timeout instead.
+		// mouse leave via the edge hover instead.
 		if (mixerExpandedRef.current) return;
 		if (timeoutRef.current) clearTimeout(timeoutRef.current);
 		timeoutRef.current = setTimeout(() => {
-			if (!splashActiveRef.current) setMode("idle");
+			if (splashActiveRef.current) return;
+			// A key press flash ends on the timer; a hovered card ends when the
+			// cursor leaves it, or it would vanish under a still cursor.
+			setMode((current) =>
+				(current === "volume" && volumeHoverRef.current) ||
+				(current === "brightness" && brightnessHoverRef.current)
+					? current
+					: "idle"
+			);
 		}, 2000);
 	}, []);
 
@@ -734,17 +746,17 @@ function OverlayApp() {
 			resetHideTimeout();
 		});
 
+		// The card shows only while hovered: leaving its space hides it at once.
+		// A leave only hides its own side, never a key press flash of the other.
 		const volEdgePromise = listen<boolean>("volume-edge-hover", (event) => {
+			if (!event.payload) volumeHoverRef.current = false;
 			if (splashActiveRef.current || !volumeOverlayEnabled || !volumeEdgeEnabled) return;
 			if (event.payload) {
+				volumeHoverRef.current = true;
 				setMode("volume");
 				if (timeoutRef.current) clearTimeout(timeoutRef.current);
 			} else {
-				if (timeoutRef.current) clearTimeout(timeoutRef.current);
-				timeoutRef.current = setTimeout(
-					() => setMode("idle"),
-					mixerExpandedRef.current ? 700 : 1500
-				);
+				setMode((current) => (current === "volume" ? "idle" : current));
 			}
 		});
 
@@ -758,13 +770,14 @@ function OverlayApp() {
 		});
 
 		const brightEdgePromise = listen<boolean>("brightness-edge-hover", (event) => {
+			if (!event.payload) brightnessHoverRef.current = false;
 			if (splashActiveRef.current || !brightnessOverlayEnabled || !brightnessEdgeEnabled) return;
 			if (event.payload) {
+				brightnessHoverRef.current = true;
 				setMode("brightness");
 				if (timeoutRef.current) clearTimeout(timeoutRef.current);
 			} else {
-				if (timeoutRef.current) clearTimeout(timeoutRef.current);
-				timeoutRef.current = setTimeout(() => setMode("idle"), 1500);
+				setMode((current) => (current === "brightness" ? "idle" : current));
 			}
 		});
 

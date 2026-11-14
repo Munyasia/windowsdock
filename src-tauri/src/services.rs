@@ -15,8 +15,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible, SetWindowsHookExW,
-    GWL_EXSTYLE, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONDOWN,
-    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    GWL_EXSTYLE, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_RBUTTONDOWN, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 use wmi::{COMLibrary, WMIConnection};
 
@@ -2132,8 +2132,10 @@ static MH_LAST_LEFT_EDGE_HOVER: AtomicI32 = AtomicI32::new(-1);
 static MH_LAST_RIGHT_EDGE_HOVER: AtomicI32 = AtomicI32::new(-1);
 static MH_DOCK_EXPIRY_MS: AtomicI64 = AtomicI64::new(0);
 static MH_TOPBAR_EXPIRY_MS: AtomicI64 = AtomicI64::new(0);
-static MH_LEFT_EXPIRY_MS: AtomicI64 = AtomicI64::new(0);
-static MH_RIGHT_EXPIRY_MS: AtomicI64 = AtomicI64::new(0);
+/// A left press that began on a volume or brightness card (the overlay was
+/// taking input) and is still held. A slider drag often runs past the card,
+/// so its edge hover stays alive until the release, which re-checks it.
+static MH_HUD_PRESS_HELD: AtomicBool = AtomicBool::new(false);
 static MH_LAST_MONITOR_UPDATE_MS: AtomicI64 = AtomicI64::new(0);
 static MH_CACHED_MON_POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 static MH_CACHED_MON_SIZE: Mutex<Option<(u32, u32)>> = Mutex::new(None);
@@ -2230,6 +2232,32 @@ fn volume_mixer_physical_rect_for(app: &AppHandle) -> Option<(i32, i32, i32, i32
     ))
 }
 
+/// Whether `cursor` is over the collapsed volume card (left edge) or the
+/// brightness card (`right`), both 42x196 CSS px and vertically centred on
+/// the primary monitor. The overlay applies `bloom-scale` as CSS zoom, so the
+/// cards grow with it as well as with the monitor's scale factor.
+fn over_hud_card(
+    app_handle: &AppHandle,
+    cursor: windows::Win32::Foundation::POINT,
+    right: bool,
+) -> bool {
+    let Ok(Some(monitor)) = app_handle.primary_monitor() else {
+        return false;
+    };
+    let size = monitor.size();
+    let pos = monitor.position();
+    let sc = monitor.scale_factor() * crate::utils::get_bloom_scale(app_handle);
+    let width = (42.0 * sc) as i32;
+    let height = (196.0 * sc) as i32;
+    let x = if right {
+        pos.x + size.width as i32 - width
+    } else {
+        pos.x
+    };
+    let y = pos.y + (size.height as i32 / 2) - (height / 2);
+    cursor.x >= x && cursor.x <= x + width && cursor.y >= y && cursor.y <= y + height
+}
+
 /// The mouse hook only runs on mouse movement, so a cursor that stops just
 /// outside the mixer would leave it open indefinitely. This watchdog re-checks
 /// the position and closes the card as soon as the cursor is off it.
@@ -2247,7 +2275,7 @@ fn setup_volume_mixer_watchdog(app_handle: AppHandle) {
             continue;
         }
         let inside = pt.x >= rx && pt.x <= rx + rw && pt.y >= ry && pt.y <= ry + rh;
-        if inside {
+        if inside || MH_HUD_PRESS_HELD.load(Ordering::Relaxed) {
             continue;
         }
         let at_left_edge = app_handle
@@ -2260,7 +2288,6 @@ fn setup_volume_mixer_watchdog(app_handle: AppHandle) {
                 pt.x <= pos.x + 8 && pt.y >= pos.y && pt.y <= pos.y + size.height as i32
             });
         if !at_left_edge && MH_LAST_LEFT_EDGE_HOVER.swap(0, Ordering::Relaxed) != 0 {
-            MH_LEFT_EXPIRY_MS.store(0, Ordering::Relaxed);
             let _ = app_handle.emit("volume-edge-hover", false);
         }
     });
@@ -3066,6 +3093,18 @@ unsafe extern "system" fn mouse_hook_proc(
     // use. A cheap foreground check, and only on presses.
     if code >= 0 && wparam.0 == WM_LBUTTONDOWN as usize {
         START_OPEN_AT_PRESS.store(crate::commands::is_start_menu_open(), Ordering::Relaxed);
+        MH_HUD_PRESS_HELD.store(
+            MH_LAST_OV_IGNORE.load(Ordering::Relaxed) == 0,
+            Ordering::Relaxed,
+        );
+    }
+    // A slider drag can end off its card with no move after it, so re-check
+    // the edge hover where it was released.
+    if code >= 0
+        && wparam.0 == WM_LBUTTONUP as usize
+        && MH_HUD_PRESS_HELD.swap(false, Ordering::Relaxed)
+    {
+        queue_cursor((*(lparam.0 as *const MSLLHOOKSTRUCT)).pt);
     }
     if code >= 0 && wparam.0 == WM_RBUTTONDOWN as usize {
         let point = (*(lparam.0 as *const MSLLHOOKSTRUCT)).pt;
@@ -3198,43 +3237,23 @@ fn process_mouse_position(app_handle: &AppHandle, cursor: windows::Win32::Founda
             cursor.x >= rx && cursor.x <= rx + rw && cursor.y >= ry && cursor.y <= ry + rh
         });
 
+        // A side's card shows only while the cursor is in its space: the edge
+        // band that opens it, then the card (and the mixer, when open). Leaving
+        // that space hides it on the same move, with no grace period. A slider
+        // drag that began on the card keeps it until the release.
+        let hud_press_held = MH_HUD_PRESS_HELD.load(Ordering::Relaxed);
+
         // --- Left Edge (Volume) ---
         if !fg_fs {
             let at_left_edge =
                 cursor.x <= (mon_x + 8) && cursor.y >= mon_y && cursor.y <= (mon_y + mon_h);
-
-            // The collapsed card extends past the 8px edge band, so once the
-            // edge hover is established, keep it alive while the cursor is
-            // over the card too (otherwise pausing on the mixer button lets
-            // the hover expire and the HUD hides mid-click).
-            let over_card = !at_left_edge
-                && !in_mixer
-                && MH_LAST_LEFT_EDGE_HOVER.load(Ordering::Relaxed) != 0
-                && app_handle
-                    .primary_monitor()
-                    .ok()
-                    .flatten()
-                    .is_some_and(|m| {
-                        let bloom_scale = crate::utils::get_bloom_scale(app_handle);
-                        let ms = m.size();
-                        let mp = m.position();
-                        let sc = m.scale_factor() * bloom_scale;
-                        let nw = (42.0 * sc) as i32;
-                        let nh = (196.0 * sc) as i32;
-                        let nx = mp.x;
-                        let ny = mp.y + (ms.height as i32 / 2) - (nh / 2);
-                        cursor.x >= nx
-                            && cursor.x <= nx + nw
-                            && cursor.y >= ny
-                            && cursor.y <= ny + nh
-                    });
-
-            if at_left_edge || in_mixer || over_card {
-                MH_LEFT_EXPIRY_MS.store(now + 500, Ordering::Relaxed);
-            }
-
-            let final_left_hover = now < MH_LEFT_EXPIRY_MS.load(Ordering::Relaxed);
             let prev = MH_LAST_LEFT_EDGE_HOVER.load(Ordering::Relaxed);
+
+            // The card reaches past the 8px edge band, so once the edge has
+            // opened it, the card itself keeps it open.
+            let final_left_hover = at_left_edge
+                || in_mixer
+                || (prev == 1 && (hud_press_held || over_hud_card(app_handle, cursor, false)));
             let new_val = if final_left_hover { 1 } else { 0 };
             if prev != new_val {
                 let _ = app_handle.emit("volume-edge-hover", final_left_hover);
@@ -3252,13 +3271,10 @@ fn process_mouse_position(app_handle: &AppHandle, cursor: windows::Win32::Founda
         if !fg_fs {
             let at_right_edge =
                 cursor.x >= (mon_x + mon_w - 8) && cursor.y >= mon_y && cursor.y <= (mon_y + mon_h);
-
-            if at_right_edge {
-                MH_RIGHT_EXPIRY_MS.store(now + 500, Ordering::Relaxed);
-            }
-
-            let final_right_hover = now < MH_RIGHT_EXPIRY_MS.load(Ordering::Relaxed);
             let prev = MH_LAST_RIGHT_EDGE_HOVER.load(Ordering::Relaxed);
+
+            let final_right_hover = at_right_edge
+                || (prev == 1 && (hud_press_held || over_hud_card(app_handle, cursor, true)));
             let new_val = if final_right_hover { 1 } else { 0 };
             if prev != new_val {
                 let _ = app_handle.emit("brightness-edge-hover", final_right_hover);
@@ -3284,39 +3300,8 @@ fn process_mouse_position(app_handle: &AppHandle, cursor: windows::Win32::Founda
                 }
                 MH_LAST_OV_IGNORE.store(1, Ordering::Relaxed);
             } else {
-                // The overlay applies `bloom-scale` as CSS zoom, so the cards
-                // are larger than 42x196 CSS px for non-default scales.
-                let bloom_scale = crate::utils::get_bloom_scale(app_handle);
-                let over_left = in_mixer
-                    || if let Ok(Some(m)) = ov_win.primary_monitor() {
-                        let ms = m.size();
-                        let mp = m.position();
-                        let sc = m.scale_factor() * bloom_scale;
-                        let nw = (42.0 * sc) as i32;
-                        let nh = (196.0 * sc) as i32;
-                        let nx = mp.x;
-                        let ny = mp.y + (ms.height as i32 / 2) - (nh / 2);
-                        cursor.x >= nx
-                            && cursor.x <= nx + nw
-                            && cursor.y >= ny
-                            && cursor.y <= ny + nh
-                    } else {
-                        false
-                    };
-
-                let over_right = if let Ok(Some(m)) = ov_win.primary_monitor() {
-                    let ms = m.size();
-                    let mp = m.position();
-                    let sc = m.scale_factor() * bloom_scale;
-                    let nw = (42.0 * sc) as i32;
-                    let nh = (196.0 * sc) as i32;
-                    let nx = mp.x + ms.width as i32 - nw;
-                    let ny = mp.y + (ms.height as i32 / 2) - (nh / 2);
-                    cursor.x >= nx && cursor.x <= nx + nw && cursor.y >= ny && cursor.y <= ny + nh
-                } else {
-                    false
-                };
-
+                let over_left = in_mixer || over_hud_card(app_handle, cursor, false);
+                let over_right = over_hud_card(app_handle, cursor, true);
                 let should_ignore = !(over_left || over_right);
                 let prev = MH_LAST_OV_IGNORE.load(Ordering::Relaxed);
                 let new_val = if should_ignore { 1 } else { 0 };
