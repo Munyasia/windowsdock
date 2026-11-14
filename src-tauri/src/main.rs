@@ -153,6 +153,7 @@ fn main() {
             open_app,
             launch_new_instance,
             update_dock_rect,
+            set_dock_corner_rect,
             update_notch_rect,
             window_region::set_window_region,
             set_dock_hovered,

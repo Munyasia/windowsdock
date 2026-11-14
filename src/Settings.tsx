@@ -251,6 +251,7 @@ function SettingsApp() {
 							toggleCalendar={settings.toggleCalendar}
 							controlsPanelEnabled={settings.controlsPanelEnabled}
 							toggleControlsPanel={settings.toggleControlsPanel}
+							commandCenterInNotch={settings.commandCenterInNotch}
 							devicesPanelEnabled={settings.devicesPanelEnabled}
 							toggleDevicesPanel={settings.toggleDevicesPanel}
 							enabledPanelCount={settings.enabledPanelCount}
@@ -307,6 +308,8 @@ function SettingsApp() {
 							toggleDockAdaptive={settings.toggleDockAdaptive}
 							dockWinNumberEnabled={settings.dockWinNumberEnabled}
 							toggleDockWinNumber={settings.toggleDockWinNumber}
+							commandCenterLocation={settings.commandCenterLocation}
+							changeCommandCenterLocation={settings.changeCommandCenterLocation}
 							dockExtrasPosition={settings.dockExtrasPosition}
 							handleDockExtrasPositionChange={settings.handleDockExtrasPositionChange}
 							dockExtrasDrives={settings.dockExtrasDrives}

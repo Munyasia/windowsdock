@@ -37,6 +37,8 @@ interface NotchTabProps {
 	toggleCalendar: () => void;
 	controlsPanelEnabled: boolean;
 	toggleControlsPanel: () => void;
+	/** False while Settings > Dock keeps the Command Center in the dock. */
+	commandCenterInNotch: boolean;
 	devicesPanelEnabled: boolean;
 	toggleDevicesPanel: () => void;
 	enabledPanelCount: number;
@@ -89,6 +91,7 @@ export function NotchTab({
 	toggleCalendar,
 	controlsPanelEnabled,
 	toggleControlsPanel,
+	commandCenterInNotch,
 	devicesPanelEnabled,
 	toggleDevicesPanel,
 	enabledPanelCount,
@@ -126,10 +129,16 @@ export function NotchTab({
 }: NotchTabProps) {
 	const panelOn: Record<NotchPanelChoice, boolean> = {
 		calendar: calendarEnabled,
-		"command-center": controlsPanelEnabled,
+		"command-center": controlsPanelEnabled && commandCenterInNotch,
 		devices: devicesPanelEnabled
 	};
-	const firstPanelOn = PANEL_CHOICES.find(([panel]) => panelOn[panel])?.[0] ?? "command-center";
+	// A Command Center kept in the dock isn't a notch panel at all.
+	const panelChoices = PANEL_CHOICES.filter(
+		([panel]) => panel !== "command-center" || commandCenterInNotch
+	);
+	const firstPanelOn =
+		panelChoices.find(([panel]) => panelOn[panel])?.[0] ??
+		(commandCenterInNotch ? "command-center" : "calendar");
 	// The notch needs at least one panel, so the last one on stays on.
 	const isLastPanel = (on: boolean) => on && enabledPanelCount <= 1;
 	const lastPanelTitle = (on: boolean) =>
@@ -219,17 +228,19 @@ export function NotchTab({
 					</SettingRow>
 				)}
 
-				<SettingRow icon={SlidersHorizontal} label="Command Center" desc="Quick toggles, Wi-Fi and Bluetooth">
-					<label className="toggle-switch" title={lastPanelTitle(controlsPanelEnabled)}>
-						<input
-							type="checkbox"
-							checked={controlsPanelEnabled}
-							disabled={isLastPanel(controlsPanelEnabled)}
-							onChange={toggleControlsPanel}
-						/>
-						<span className="slider"></span>
-					</label>
-				</SettingRow>
+				{commandCenterInNotch && (
+					<SettingRow icon={SlidersHorizontal} label="Command Center" desc="Quick toggles, Wi-Fi and Bluetooth">
+						<label className="toggle-switch" title={lastPanelTitle(controlsPanelEnabled)}>
+							<input
+								type="checkbox"
+								checked={controlsPanelEnabled}
+								disabled={isLastPanel(controlsPanelEnabled)}
+								onChange={toggleControlsPanel}
+							/>
+							<span className="slider"></span>
+						</label>
+					</SettingRow>
+				)}
 
 				<SettingRow
 					icon={Headphones}
@@ -265,7 +276,7 @@ export function NotchTab({
 							value={panelOn[notchDefaultPanel] ? notchDefaultPanel : firstPanelOn}
 							onChange={(e) => changeNotchDefaultPanel(e.target.value as NotchPanelChoice)}
 						>
-							{PANEL_CHOICES.map(([panel, label]) => (
+							{panelChoices.map(([panel, label]) => (
 								<option key={panel} value={panel} disabled={!panelOn[panel]}>
 									{label}
 								</option>

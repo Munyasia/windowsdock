@@ -27,6 +27,11 @@ static WIN_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 /// Digit (1-9) of the currently held Win+Number combo, 0 when none. Key
 /// auto-repeat re-fires the keydown; only the first press may toggle an app.
 static WIN_NUMBER_HELD: AtomicU8 = AtomicU8::new(0);
+/// Whether the A of a Win+A combo is held, so auto-repeat can't toggle the
+/// Command Center over and over.
+static WIN_A_HELD: AtomicBool = AtomicBool::new(false);
+/// Virtual key code of the A key.
+const VK_A_KEY: u16 = 0x41;
 /// Virtual key Microsoft documents as "unassigned", used as the mask key.
 /// See `send_start_menu_mask`.
 const MASK_VK: u16 = 0xE8;
@@ -34,18 +39,20 @@ const MASK_VK: u16 = 0xE8;
 /// Raw handle of the installed keyboard hook, 0 while none is installed.
 static KEYBOARD_HOOK: AtomicIsize = AtomicIsize::new(0);
 
-/// Win+1-9 is the only feature that needs a global keyboard hook: Explorer
-/// already registers those hotkeys, so `RegisterHotKey` can't claim them.
-/// Volume and brightness keys are left to Windows, and Bloom's overlays follow
-/// the resulting changes instead. The hook only exists while Win+1-9 is in use
-/// (the dock replaces the taskbar and the setting is on); the rest of the time
-/// Bloom doesn't see the keyboard at all.
+/// Win+1-9 and Win+A are the only features that need a global keyboard hook:
+/// Explorer already registers those hotkeys, so `RegisterHotKey` can't claim
+/// them. Volume and brightness keys are left to Windows, and Bloom's overlays
+/// follow the resulting changes instead. The hook only exists while the dock
+/// replaces the taskbar and one of them is in use (Win+1-9 is on, or the
+/// Command Center lives in the dock); the rest of the time Bloom doesn't see
+/// the keyboard at all.
 pub fn setup_keyboard_hook(app_handle: AppHandle) {
     let _ = KEYBOARD_HOOK_APP_HANDLE.set(app_handle.clone());
     std::thread::spawn(move || {
         // Exiting removes the hook with the process; never touch it mid-shutdown.
         while !SHUTTING_DOWN.load(Ordering::Relaxed) {
-            let wanted = NATIVE_TASKBAR_HIDDEN.load(Ordering::Relaxed) && dock_win_number_enabled();
+            let wanted = NATIVE_TASKBAR_HIDDEN.load(Ordering::Relaxed)
+                && (dock_win_number_enabled() || command_center_in_dock());
             if wanted != (KEYBOARD_HOOK.load(Ordering::Relaxed) != 0) {
                 // A low-level hook runs on the thread that installed it, which
                 // needs a message loop, so install and remove it on the main thread.
@@ -69,6 +76,7 @@ fn set_keyboard_hook(enabled: bool) {
             KEYBOARD_HOOK.store(0, Ordering::Relaxed);
             WIN_KEY_DOWN.store(false, Ordering::Relaxed);
             WIN_NUMBER_HELD.store(0, Ordering::Relaxed);
+            WIN_A_HELD.store(false, Ordering::Relaxed);
         }
     }
 }
@@ -88,6 +96,18 @@ fn dock_win_number_enabled() -> bool {
     };
     crate::utils::get_setting_str(app, "bloom-dock-win-number-enabled")
         .map(|v| v != "false")
+        .unwrap_or(true)
+}
+
+/// Settings puts the Command Center in the dock's corner by default
+/// (`bloom-command-center-location`), where Win+A opens it like the
+/// taskbar's quick settings.
+fn command_center_in_dock() -> bool {
+    let Some(app) = KEYBOARD_HOOK_APP_HANDLE.get() else {
+        return false;
+    };
+    crate::utils::get_setting_str(app, "bloom-command-center-location")
+        .map(|v| v != "notch")
         .unwrap_or(true)
 }
 
@@ -163,6 +183,16 @@ fn emit_dock_win_number(index: u8) {
     });
 }
 
+/// Opens or closes the dock's Command Center.
+fn emit_dock_command_center_toggle() {
+    let Some(app) = KEYBOARD_HOOK_APP_HANDLE.get().cloned() else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        let _ = app.emit_to("dock", "dock-command-center-toggle", ());
+    });
+}
+
 unsafe extern "system" fn keyboard_hook_proc(
     code: i32,
     wparam: windows::Win32::Foundation::WPARAM,
@@ -187,9 +217,11 @@ unsafe extern "system" fn keyboard_hook_proc(
                     // A fresh Win press always starts a fresh combo, even if the
                     // previous digit's keyup was missed.
                     WIN_NUMBER_HELD.store(0, Ordering::Relaxed);
+                    WIN_A_HELD.store(false, Ordering::Relaxed);
                 } else if is_up {
                     WIN_KEY_DOWN.store(false, Ordering::Relaxed);
                     WIN_NUMBER_HELD.store(0, Ordering::Relaxed);
+                    WIN_A_HELD.store(false, Ordering::Relaxed);
                 }
             } else if WIN_KEY_DOWN.load(Ordering::Relaxed) {
                 if let Some(index) = win_number_index(vk_code.0) {
@@ -211,6 +243,26 @@ unsafe extern "system" fn keyboard_hook_proc(
                             if WIN_NUMBER_HELD.swap(slot, Ordering::Relaxed) != slot {
                                 send_start_menu_mask();
                                 emit_dock_win_number(index);
+                            }
+                            return windows::Win32::Foundation::LRESULT(1);
+                        }
+                    }
+                } else if vk_code.0 == VK_A_KEY {
+                    // Win+A: the taskbar's quick settings, which the dock's
+                    // Command Center stands in for. The keyup still passes, as
+                    // for Win+Number; Explorer acts on the keydown only.
+                    if is_up {
+                        WIN_A_HELD.store(false, Ordering::Relaxed);
+                    } else if is_down {
+                        if !win_key_physically_down() {
+                            WIN_KEY_DOWN.store(false, Ordering::Relaxed);
+                            WIN_A_HELD.store(false, Ordering::Relaxed);
+                        } else if NATIVE_TASKBAR_HIDDEN.load(Ordering::Relaxed)
+                            && command_center_in_dock()
+                        {
+                            if !WIN_A_HELD.swap(true, Ordering::Relaxed) {
+                                send_start_menu_mask();
+                                emit_dock_command_center_toggle();
                             }
                             return windows::Win32::Foundation::LRESULT(1);
                         }
@@ -2881,6 +2933,27 @@ fn update_dock_interaction(
                         is_click_interactive = true;
                     }
                     dock_span = Some((rx, rx + rw));
+                }
+            }
+
+            // The Command Center's corner pill, which sits apart from the bar.
+            if !is_click_interactive {
+                if let Ok(rect) = DOCK_CORNER_RECT.try_lock() {
+                    if let Some(r) = *rect {
+                        let scale = dock_win.scale_factor().unwrap_or(1.0);
+                        let pad = (4.0 * scale) as i32;
+                        let rx = win_pos.x + (r.x as f64 * scale) as i32 - pad;
+                        let ry = win_pos.y + (r.y as f64 * scale) as i32 - pad;
+                        let rw = (r.width as f64 * scale) as i32 + pad * 2;
+                        let rh = (r.height as f64 * scale) as i32 + pad * 2;
+                        if cursor.x >= rx
+                            && cursor.x <= (rx + rw)
+                            && cursor.y >= ry
+                            && cursor.y <= (ry + rh)
+                        {
+                            is_click_interactive = true;
+                        }
+                    }
                 }
             }
 

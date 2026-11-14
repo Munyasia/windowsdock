@@ -40,6 +40,9 @@ pub static DOCK_START_PRESS_MS: AtomicI64 = AtomicI64::new(0);
 // on the dock (which closes its own menus) or outside it.
 pub static DOCK_HWND: AtomicIsize = AtomicIsize::new(0);
 pub static MENU_RECT: Mutex<Option<IntRect>> = Mutex::new(None);
+/// The Command Center's corner pill in the dock window, in its CSS pixels.
+/// None while the pill is hidden or the Command Center lives in the notch.
+pub static DOCK_CORNER_RECT: Mutex<Option<IntRect>> = Mutex::new(None);
 pub static ICON_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 pub static INSTALLED_APPS_CACHE: OnceLock<Mutex<Vec<AppInfo>>> = OnceLock::new();

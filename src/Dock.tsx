@@ -1,5 +1,6 @@
 import {
 	useState,
+	useCallback,
 	useEffect,
 	useLayoutEffect,
 	useMemo,
@@ -8,11 +9,20 @@ import {
 	memo,
 	type ReactNode
 } from "react";
-import { motion, AnimatePresence, Reorder } from "framer-motion";
+import { motion, AnimatePresence, Reorder, useReducedMotion } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import "./Dock.css";
 import { EdgeSurface } from "./components/EdgeSurface";
+import { CommandCenter, WifiIcon, applyBarMode, nextBarMode } from "./components/CommandCenter";
+import { readCommandCenterLocation } from "./commandCenterLocation";
+import { WifiPanel } from "./components/WifiPanel";
+import { BluetoothPanel } from "./components/BluetoothPanel";
+import { BatteryIcon } from "./components/BatteryIcon";
+import { SpeakerIcon } from "./icons";
+import { useQuickControls } from "./hooks/useQuickControls";
+import type { BatteryDetails } from "./batteryTooltip";
 import { initTheme } from "./theme";
 import { useSettingsSync } from "./hooks/useSettingsSync";
 import { reloadIfMirrorWasStale } from "./hooks/settingsMirror";
@@ -162,6 +172,16 @@ const ITEM_INITIAL = { opacity: 0, scale: 0 };
 const ITEM_ANIMATE = { opacity: 1, scale: 1 };
 const ITEM_EXIT = { opacity: 0, scale: 0 };
 
+// The Command Center panel's views: its tiles, or a tile's own list.
+type CommandCenterView = "main" | "wifi" | "bluetooth";
+
+// What the webview's Battery Status API hands back, as far as the corner
+// pill reads it.
+interface BatteryManagerLike extends EventTarget {
+	level: number;
+	charging: boolean;
+}
+
 // Reorder value for the divider between pinned and running icons. No
 // itemKey can contain a NUL, so it never collides with an app.
 const PIN_DIVIDER = "\0pin-divider";
@@ -277,6 +297,25 @@ const Dock = memo(function Dock() {
 	const isVisible = systemVisible || shellInteraction;
 	const [showAddPopup, setShowAddPopup] = useState(false);
 	const [nativeMenuOpen, setNativeMenuOpen] = useState(false);
+	// The Command Center in the bottom-right corner, unless Settings puts it in
+	// the notch. ccView is null while the panel is closed, else the view shown.
+	const [commandCenterLocation, setCommandCenterLocation] = useState(() =>
+		readCommandCenterLocation(localStorage.getItem("bloom-command-center-location"))
+	);
+	const commandCenterInDock = commandCenterLocation === "dock";
+	const [ccView, setCcView] = useState<CommandCenterView | null>(null);
+	const ccOpen = ccView !== null;
+	const [isCornerHovered, setIsCornerHovered] = useState(false);
+	const [cornerWidth, setCornerWidth] = useState(0);
+	const cornerSlotRef = useRef<HTMLDivElement>(null);
+	const ccAnchorRef = useRef<HTMLDivElement>(null);
+	// For the panel's Notch Mode tile.
+	const [notchMode, setNotchMode] = useState(() => {
+		const raw = localStorage.getItem("bloom-notch-mode") || "fixed";
+		return raw === "auto-hide" ? "smart" : raw;
+	});
+	const quickControls = useQuickControls({ panelOpen: ccOpen, watchBatterySaver: ccOpen });
+	const reduceMotion = useReducedMotion();
 	const [contextMenu, setContextMenu] = useState<{
 		x: number;
 		y: number;
@@ -329,9 +368,10 @@ const Dock = memo(function Dock() {
 		}
 	}, [showAddPopup, scale]);
 
-	const isCurrentlyHovered = isDockHovered || isEdgeHovered;
+	const isCurrentlyHovered = isDockHovered || isEdgeHovered || isCornerHovered;
 	const [interactionState, setInteractionState] = useState<"active" | "grace" | "none">("none");
-	const isAnyInteraction = isCurrentlyHovered || !!contextMenu || showAddPopup || nativeMenuOpen;
+	const isAnyInteraction =
+		isCurrentlyHovered || !!contextMenu || showAddPopup || nativeMenuOpen || ccOpen;
 
 	const previewTimerRef = useRef<any>(null);
 	const isPreviewHoveredRef = useRef(false);
@@ -359,7 +399,12 @@ const Dock = memo(function Dock() {
 		dockAdaptive && dockMode === "fixed" && isMaximized && isExpanded && !isHidden && isVisible;
 	// Nearly full width — 24px margin per side at the visual (scaled) size.
 	// Pre-transform: visual = width * scale, so width = (viewport - 48*scale) / scale.
-	const adaptiveWidth = (viewportWidth - 48 * scale) / scale;
+	// The bar stays centred, so clearing the Command Center's corner pill takes
+	// the pill's width (plus room for both flares) off each side.
+	const cornerReserve = commandCenterInDock && cornerWidth > 0 ? cornerWidth + 40 * scale : 0;
+	const adaptiveWidth = (viewportWidth - 48 * scale - 2 * cornerReserve) / scale;
+	// The corner pill comes and goes with the bar itself.
+	const cornerShown = commandCenterInDock && isReady && isExpanded && isVisible && !isHidden;
 
 	useEffect(() => {
 		let cleared = false;
@@ -485,6 +530,12 @@ const Dock = memo(function Dock() {
 			const extrasPosition = getVal("bloom-dock-extras-position", "off");
 			if (extrasPosition) setDockExtrasPosition(extrasPosition);
 
+			setCommandCenterLocation(
+				readCommandCenterLocation(getVal("bloom-command-center-location", "dock"))
+			);
+			const nMode = getVal("bloom-notch-mode", "fixed") || "fixed";
+			setNotchMode(nMode === "auto-hide" ? "smart" : nMode);
+
 			const scaleVal = getVal("bloom-scale");
 			if (scaleVal !== null) setScale(parseFloat(scaleVal));
 
@@ -559,6 +610,12 @@ const Dock = memo(function Dock() {
 		"bloom-start-icon": setStartIcon,
 		"bloom-scale": setScale,
 		"bloom-dock-extras-position": setDockExtrasPosition,
+		"bloom-command-center-location": {
+			set: (value: unknown) => setCommandCenterLocation(readCommandCenterLocation(value)),
+			defaultValue: "dock"
+		},
+		"bloom-notch-mode": (value: unknown) =>
+			setNotchMode(value === "auto-hide" ? "smart" : String(value)),
 		"bloom-dock-extras-drives": () => setDockExtrasRevision((r) => r + 1),
 		"bloom-dock-extras-recycle-bin": () => setDockExtrasRevision((r) => r + 1),
 		"bloom-dock-extras-hidden-drives": () => setDockExtrasRevision((r) => r + 1),
@@ -942,9 +999,12 @@ const Dock = memo(function Dock() {
 		});
 	}, [contextMenu, scale]);
 
+	// Any press elsewhere in the dock closes the Command Center too, the way a
+	// taskbar click closes Windows' quick settings.
 	const closeMenu = () => {
 		setContextMenu(null);
 		setActiveSubmenu(null);
+		setCcView(null);
 		invoke("set_menu_open", { open: false, rect: null }).catch(() => {});
 	};
 
@@ -961,11 +1021,163 @@ const Dock = memo(function Dock() {
 			setContextMenu(null);
 			setActiveSubmenu(null);
 			setShowAddPopup(false);
+			setCcView(null);
 		});
 		return () => {
 			unlisten.then((f) => f());
 		};
 	}, []);
+
+	const openCommandCenter = (view: CommandCenterView) => {
+		setContextMenu(null);
+		setActiveSubmenu(null);
+		setShowAddPopup(false);
+		setPreviewData(null);
+		setHoveredApp(null);
+		setCcView(view);
+	};
+	const openCommandCenterRef = useRef(openCommandCenter);
+	openCommandCenterRef.current = openCommandCenter;
+	const commandCenterInDockRef = useRef(commandCenterInDock);
+	commandCenterInDockRef.current = commandCenterInDock;
+	const ccOpenRef = useRef(ccOpen);
+	ccOpenRef.current = ccOpen;
+
+	// Win+A from the backend's keyboard hook, and the notch's Bluetooth device
+	// alert, whose device list now lives here.
+	useEffect(() => {
+		const unlistenToggle = listen("dock-command-center-toggle", () => {
+			if (!commandCenterInDockRef.current) return;
+			if (ccOpenRef.current) setCcView(null);
+			else openCommandCenterRef.current("main");
+		});
+		const unlistenOpen = listen<string>("dock-command-center-open", ({ payload }) => {
+			if (!commandCenterInDockRef.current) return;
+			openCommandCenterRef.current(payload === "wifi" || payload === "bluetooth" ? payload : "main");
+		});
+		return () => {
+			unlistenToggle.then((f) => f());
+			unlistenOpen.then((f) => f());
+		};
+	}, []);
+
+	useEffect(() => {
+		if (!commandCenterInDock) setCcView(null);
+	}, [commandCenterInDock]);
+
+	// One popup at a time: a right-click menu or the Add App popup replaces the
+	// panel, since the backend's hit rect only follows one of them.
+	useEffect(() => {
+		if (contextMenu || showAddPopup) setCcView(null);
+	}, [contextMenu, showAddPopup]);
+
+	// Escape closes the panel. Keys only arrive once the dock has focus, which
+	// it takes for typing a Wi-Fi password.
+	useEffect(() => {
+		if (!ccOpen) return;
+		const onKeyDown = (e: KeyboardEvent) => {
+			if (e.key === "Escape") setCcView(null);
+		};
+		window.addEventListener("keydown", onKeyDown);
+		return () => window.removeEventListener("keydown", onKeyDown);
+	}, [ccOpen]);
+
+	// The dock is WS_EX_NOACTIVATE, so DOM focus alone gets no keystrokes. A
+	// field that wants typing asks for the window's focus, then keeps its own.
+	// Stable: the Wi-Fi and Bluetooth lists subscribe to events keyed on it.
+	const focusDockForTyping = useCallback((pinned: boolean) => {
+		if (!pinned) return;
+		const field = document.activeElement as HTMLElement | null;
+		getCurrentWebviewWindow()
+			.setFocus()
+			.then(() => field?.focus())
+			.catch(console.error);
+	}, []);
+
+	// The tiles sit to the left of the Wi-Fi and Bluetooth lists: opening a list
+	// slides it in from the right, and Back slides the tiles in from the left.
+	const ccViewMotion = (side: 1 | -1) => ({
+		initial: { opacity: 0, x: reduceMotion ? 0 : side * 18 },
+		animate: { opacity: 1, x: 0 },
+		exit: { opacity: 0, x: reduceMotion ? 0 : side * 18 },
+		transition: { duration: 0.18, ease: [0.2, 0.8, 0.2, 1] as const }
+	});
+
+	const cycleDockMode = (e: React.MouseEvent) => {
+		e.stopPropagation();
+		const next = nextBarMode(dockMode);
+		setDockMode(next);
+		void applyBarMode("dock", next);
+	};
+
+	const cycleNotchMode = (e: React.MouseEvent) => {
+		e.stopPropagation();
+		const next = nextBarMode(notchMode);
+		setNotchMode(next);
+		void applyBarMode("notch", next);
+	};
+
+	// The corner pill's battery, on devices that have one.
+	const [battery, setBattery] = useState<{ level: number; charging: boolean } | null>(null);
+	useEffect(() => {
+		if (!commandCenterInDock) return;
+		let cancelled = false;
+		let stop = () => {};
+		(async () => {
+			try {
+				const details = await invoke<BatteryDetails>("get_battery_details");
+				if (cancelled || !details.present) return;
+				const nav = navigator as Navigator & { getBattery?: () => Promise<BatteryManagerLike> };
+				const manager = await nav.getBattery?.();
+				if (!manager || cancelled) return;
+				const update = () =>
+					setBattery({ level: Math.round(manager.level * 100), charging: manager.charging });
+				update();
+				manager.addEventListener("levelchange", update);
+				manager.addEventListener("chargingchange", update);
+				stop = () => {
+					manager.removeEventListener("levelchange", update);
+					manager.removeEventListener("chargingchange", update);
+				};
+			} catch (err) {
+				console.error("Failed to read the battery for the corner pill:", err);
+			}
+		})();
+		return () => {
+			cancelled = true;
+			stop();
+		};
+	}, [commandCenterInDock]);
+
+	// The corner pill takes clicks only over itself (see set_dock_corner_rect),
+	// and its width keeps an adaptive full-width bar clear of it.
+	useEffect(() => {
+		const slot = cornerSlotRef.current;
+		if (!cornerShown || !slot) {
+			invoke("set_dock_corner_rect", { rect: null }).catch(() => {});
+			return;
+		}
+		const report = () => {
+			const r = slot.getBoundingClientRect();
+			setCornerWidth(r.width);
+			invoke("set_dock_corner_rect", {
+				rect: {
+					x: Math.round(r.x),
+					y: Math.round(r.y),
+					width: Math.round(r.width),
+					height: Math.round(r.height)
+				}
+			}).catch(() => {});
+		};
+		report();
+		const observer = new ResizeObserver(report);
+		observer.observe(slot);
+		window.addEventListener("resize", report);
+		return () => {
+			observer.disconnect();
+			window.removeEventListener("resize", report);
+		};
+	}, [cornerShown, scale]);
 
 	// The tallest the expanded bar has been, which sets the region's bottom band.
 	const dockBandHeightRef = useRef(0);
@@ -1001,7 +1213,10 @@ const Dock = memo(function Dock() {
 				[".preview-tooltip", 40],
 				[".context-menu", 34],
 				[".submenu", 34],
-				[".dock-toast", 20]
+				[".dock-toast", 20],
+				// The anchor isn't transformed, so it holds the panel's final box
+				// while the panel itself is still sliding up.
+				[".cc-dock-anchor", 40]
 			])
 		);
 		// The Add App popup grows from scaleY 0, and that animation doesn't
@@ -1040,10 +1255,19 @@ const Dock = memo(function Dock() {
 				height: Math.round(r.height)
 			};
 			open = true;
+		} else if (ccOpen && ccAnchorRef.current) {
+			const r = ccAnchorRef.current.getBoundingClientRect();
+			rect = {
+				x: Math.round(r.x),
+				y: Math.round(r.y),
+				width: Math.round(r.width),
+				height: Math.round(r.height)
+			};
+			open = true;
 		}
 
 		invoke("set_menu_open", { open, rect }).catch(() => {});
-	}, [contextMenu, menuPos, showAddPopup, pinnedApps, activeApps, activeSubmenu, scale]);
+	}, [contextMenu, menuPos, showAddPopup, pinnedApps, activeApps, activeSubmenu, scale, ccOpen]);
 
 	const dockItems = useMemo(() => {
 		const runningMap = new Map();
@@ -1169,7 +1393,7 @@ const Dock = memo(function Dock() {
 	);
 	// Only a deliberate icon hover dismisses Start. Once dismissed, the session
 	// belongs to the whole dock, including the gaps between icons and its popups.
-	const dockPopupRequested = !!contextMenu || showAddPopup || nativeMenuOpen;
+	const dockPopupRequested = !!contextMenu || showAddPopup || nativeMenuOpen || ccOpen;
 	const dockHoverTarget =
 		hoveredApp !== null && (!startItem || hoveredApp !== itemKey(startItem)) ? hoveredApp : null;
 	const keepShellInteraction =
@@ -1302,8 +1526,9 @@ const Dock = memo(function Dock() {
 	useEffect(() => {
 		// Only report true dock-window hover, not the edge-hover from Rust,
 		// to avoid a feedback loop that keeps the dock open.
-		invoke("set_dock_hovered", { hovered: isDockHovered }).catch(() => {});
-	}, [isDockHovered]);
+		// The corner pill counts as the dock, so resting on it keeps both shown.
+		invoke("set_dock_hovered", { hovered: isDockHovered || isCornerHovered }).catch(() => {});
+	}, [isDockHovered, isCornerHovered]);
 
 	useEffect(() => {
 		const handleBlur = () => {
@@ -1812,6 +2037,139 @@ const Dock = memo(function Dock() {
 					</AnimatePresence>
 				</motion.div>
 			</div>
+
+			{/* Command Center: the corner pill, like the taskbar's quick settings
+			    button, and the panel it opens above itself. */}
+			{commandCenterInDock && (
+				<div ref={cornerSlotRef} className="cc-corner-slot" style={{ zoom: scale }}>
+					{/* The whole pill takes the click; the button inside gives it a
+					    name and keyboard access, and its click bubbles up here. */}
+					<motion.div
+						className={`cc-corner${ccOpen ? " open" : ""}`}
+						initial={false}
+						animate={{ y: cornerShown ? 0 : 90, opacity: cornerShown ? 1 : 0 }}
+						transition={{
+							y: reduceMotion
+								? { duration: 0 }
+								: { type: "spring", stiffness: 400, damping: 35, mass: 0.8 },
+							opacity: { duration: 0.2 }
+						}}
+						onMouseEnter={() => setIsCornerHovered(true)}
+						onMouseLeave={() => setIsCornerHovered(false)}
+						onClick={(e) => {
+							e.stopPropagation();
+							if (ccOpen) setCcView(null);
+							else openCommandCenter("main");
+						}}
+					>
+						<EdgeSurface
+							edge="bottom"
+							flares
+							reflective={edgeShineEnabled}
+							resolutionScale={scale}
+						/>
+						<button
+							type="button"
+							className="cc-corner-status"
+							aria-label="Command Center"
+							aria-haspopup="dialog"
+							aria-expanded={ccOpen}
+						>
+							<WifiIcon
+								enabled={quickControls.wifiEnabled}
+								connected={quickControls.wifiConnected}
+							/>
+							<SpeakerIcon
+								size={16}
+								className="cc-corner-speaker"
+								muted={quickControls.displayVolume === 0}
+							/>
+							{battery && (
+								<span className="cc-corner-battery">
+									<BatteryIcon
+										charging={battery.charging}
+										level={battery.level}
+										fill="currentColor"
+									/>
+									<span>{battery.level}%</span>
+								</span>
+							)}
+						</button>
+					</motion.div>
+				</div>
+			)}
+
+			<AnimatePresence>
+				{ccOpen && (
+					<div key="cc-panel" ref={ccAnchorRef} className="cc-dock-anchor" style={{ zoom: scale }}>
+						<motion.div
+							className="cc-dock-panel"
+							role="dialog"
+							aria-label="Command Center"
+							initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 28 }}
+							animate={{
+								opacity: 1,
+								y: 0,
+								transition: { duration: 0.26, ease: [0.1, 0.9, 0.2, 1] }
+							}}
+							exit={
+								reduceMotion
+									? { opacity: 0, transition: { duration: 0.12 } }
+									: { opacity: 0, y: 20, transition: { duration: 0.16, ease: [0.7, 0, 1, 0.5] } }
+							}
+							onClick={(e) => e.stopPropagation()}
+							onContextMenu={(e) => {
+								e.preventDefault();
+								e.stopPropagation();
+							}}
+						>
+							<AnimatePresence initial={false}>
+								{ccView === "main" && (
+									<motion.div
+										key="main"
+										className="cc-dock-view cc-dock-main cc-large"
+										{...ccViewMotion(-1)}
+									>
+										<CommandCenter
+											controls={quickControls}
+											dockMode={dockMode}
+											notchMode={notchMode}
+											onCycleDockMode={cycleDockMode}
+											onCycleNotchMode={cycleNotchMode}
+											onOpenWifi={() => setCcView("wifi")}
+											onOpenBluetooth={() => setCcView("bluetooth")}
+										/>
+									</motion.div>
+								)}
+								{ccView === "wifi" && (
+									<motion.div key="wifi" className="cc-dock-view" {...ccViewMotion(1)}>
+										<div className="cc-dock-zoom">
+											<WifiPanel
+												enabled={quickControls.wifiEnabled}
+												onToggle={quickControls.toggleWifi}
+												onBack={() => setCcView("main")}
+												onPinChange={focusDockForTyping}
+											/>
+										</div>
+									</motion.div>
+								)}
+								{ccView === "bluetooth" && (
+									<motion.div key="bluetooth" className="cc-dock-view" {...ccViewMotion(1)}>
+										<div className="cc-dock-zoom">
+											<BluetoothPanel
+												enabled={quickControls.bluetoothEnabled}
+												onToggle={quickControls.toggleBluetooth}
+												onBack={() => setCcView("main")}
+												onPinChange={focusDockForTyping}
+											/>
+										</div>
+									</motion.div>
+								)}
+							</AnimatePresence>
+						</motion.div>
+					</div>
+				)}
+			</AnimatePresence>
 
 			{contextMenu && (
 				<div

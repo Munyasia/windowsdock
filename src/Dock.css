@@ -802,3 +802,146 @@ body {
 	background: #888;
 	box-shadow: none;
 }
+
+/* ===== Command Center in the dock =====
+   A pill in the bottom-right corner, where the taskbar keeps its quick
+   settings button, drawn with the same edge surface as the dock bar. Its
+   panel opens above it and slides up the way Windows' own does. Both live
+   in zoomed boxes (zoom: bloom-scale) so the panel's text and targets stay
+   readable at the dock's size. */
+.cc-corner-slot {
+	position: fixed;
+	right: 16px;
+	bottom: 0;
+	z-index: 2;
+	pointer-events: none;
+}
+
+.cc-corner {
+	--surface-bg: var(--bloom-bg, rgba(0, 0, 0, 0.8));
+	--surface-edge: var(--bloom-text, white);
+	--surface-light: white;
+	pointer-events: auto;
+	position: relative;
+	isolation: isolate;
+	display: flex;
+	align-items: center;
+	height: 52px;
+	padding: 8px;
+	box-sizing: border-box;
+	border-radius: 18px 18px 0 0;
+	color: var(--bloom-text, white);
+	cursor: pointer;
+	-webkit-app-region: no-drag;
+}
+
+.cc-corner-status {
+	display: flex;
+	align-items: center;
+	gap: 14px;
+	height: 36px;
+	padding: 0 14px;
+	border: none;
+	border-radius: 12px;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	cursor: inherit;
+	transition: background 0.15s ease;
+}
+
+.cc-corner-status:focus-visible {
+	outline: 2px solid var(--bloom-text, white);
+	outline-offset: -2px;
+}
+
+.cc-corner:hover .cc-corner-status {
+	background: color-mix(in srgb, var(--bloom-text, white) 10%, transparent);
+}
+
+.cc-corner.open .cc-corner-status {
+	background: color-mix(in srgb, var(--bloom-text, white) 16%, transparent);
+}
+
+.cc-corner-status > svg {
+	width: 16px;
+	height: 16px;
+	flex: none;
+}
+
+/* The SF speaker glyph carries no fill of its own. */
+.cc-corner-speaker {
+	fill: currentColor;
+}
+
+.cc-corner-battery {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 12.5px;
+	font-weight: 600;
+	font-variant-numeric: tabular-nums;
+}
+
+/* Untransformed, so the window region and the backend's hit rect get the
+   panel's final box even mid-slide. Sits 12px above the 52px pill. */
+.cc-dock-anchor {
+	position: fixed;
+	right: 16px;
+	bottom: 64px;
+	width: 400px;
+	height: 320px;
+	z-index: 3;
+	pointer-events: none;
+}
+
+.cc-dock-panel {
+	pointer-events: auto;
+	position: relative;
+	width: 100%;
+	height: 100%;
+	box-sizing: border-box;
+	overflow: hidden;
+	border-radius: 20px;
+	background: var(--bloom-bg-expanded, rgba(0, 0, 0, 0.92));
+	border: 1px solid var(--bloom-border, rgba(255, 255, 255, 0.1));
+	box-shadow:
+		0 18px 48px rgba(0, 0, 0, 0.45),
+		inset 0 1px 0 color-mix(in srgb, var(--bloom-text, white) 10%, transparent);
+	color: var(--bloom-text, white);
+	font-family: inherit;
+}
+
+.light-mode .cc-dock-panel {
+	box-shadow:
+		0 18px 48px rgba(0, 0, 0, 0.14),
+		inset 0 1px 0 rgba(255, 255, 255, 0.6);
+}
+
+/* Each view fills the panel inside 14px of padding: 370 by 290. */
+.cc-dock-view {
+	position: absolute;
+	inset: 14px;
+	display: flex;
+	flex-direction: column;
+}
+
+.cc-dock-main {
+	justify-content: space-between;
+}
+
+/* The Wi-Fi and Bluetooth lists keep the notch's styles, scaled up as one
+   block, and fill the view exactly. */
+.cc-dock-zoom {
+	position: relative;
+	zoom: 1.2;
+	width: calc(370px / 1.2);
+	height: calc(290px / 1.2);
+}
+
+.cc-dock-zoom .qp {
+	top: 0;
+	height: 100%;
+	padding: 0;
+	border-radius: 0;
+}

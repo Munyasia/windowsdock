@@ -19,9 +19,11 @@ import {
 	FolderOpen,
 	FolderPlus,
 	Plus,
+	SlidersHorizontal,
 	X
 } from "lucide-react";
 import { SettingRow } from "./SettingRow";
+import { readCommandCenterLocation, type CommandCenterLocation } from "../commandCenterLocation";
 import {
 	KNOWN_FOLDER_OPTIONS,
 	driveLetter,
@@ -121,6 +123,8 @@ interface DockTabProps {
 	toggleDockAdaptive: () => void;
 	dockWinNumberEnabled: boolean;
 	toggleDockWinNumber: () => void;
+	commandCenterLocation: CommandCenterLocation;
+	changeCommandCenterLocation: (location: CommandCenterLocation) => void;
 	dockExtrasPosition: string;
 	handleDockExtrasPositionChange: (position: string) => void;
 	dockExtrasDrives: boolean;
@@ -159,6 +163,8 @@ export function DockTab({
 	toggleDockAdaptive,
 	dockWinNumberEnabled,
 	toggleDockWinNumber,
+	commandCenterLocation,
+	changeCommandCenterLocation,
 	dockExtrasPosition,
 	handleDockExtrasPositionChange,
 	dockExtrasDrives,
@@ -282,6 +288,28 @@ export function DockTab({
 								/>
 								<span className="slider"></span>
 							</label>
+						</SettingRow>
+
+						<SettingRow
+							icon={SlidersHorizontal}
+							label="Command Center"
+							desc={
+								commandCenterLocation === "dock"
+									? "Wi-Fi, Bluetooth, volume and brightness in the bottom-right corner. Win+A opens it"
+									: "Wi-Fi, Bluetooth, volume and brightness in the notch"
+							}
+						>
+							<select
+								className="settings-select"
+								aria-label="Command Center location"
+								value={commandCenterLocation}
+								onChange={(e) =>
+									changeCommandCenterLocation(readCommandCenterLocation(e.target.value))
+								}
+							>
+								<option value="dock">Dock</option>
+								<option value="notch">Notch</option>
+							</select>
 						</SettingRow>
 
 						<SettingRow icon={Copy} label="Task View" desc="Show the Task View button beside Start">

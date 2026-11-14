@@ -159,6 +159,15 @@ pub async fn update_dock_rect(rect: IntRect, overlap_rect: Option<IntRect>) {
     }
 }
 
+/// The dock window is click-through outside the bar it reports, so the
+/// Command Center's corner pill reports its own box to take clicks too.
+#[tauri::command]
+pub async fn set_dock_corner_rect(rect: Option<IntRect>) {
+    if let Ok(mut r) = DOCK_CORNER_RECT.lock() {
+        *r = rect;
+    }
+}
+
 #[tauri::command]
 pub async fn update_notch_rect(rect: IntRect) {
     if let Ok(mut r) = NOTCH_RECT.lock() {

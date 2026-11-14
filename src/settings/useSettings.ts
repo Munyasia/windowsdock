@@ -16,6 +16,7 @@ import {
 	DEFAULT_ENABLED_FOLDERS
 } from "../dockExtras";
 import type { WidgetConfig } from "./types";
+import { readCommandCenterLocation, type CommandCenterLocation } from "../commandCenterLocation";
 
 function readBool(val: string | null): boolean {
 	return val === "true";
@@ -47,6 +48,9 @@ export function useSettings() {
 	const [calendarMondayFirst, setCalendarMondayFirst] = useState(false);
 	const [calendarEnabled, setCalendarEnabled] = useState(true);
 	const [controlsPanelEnabled, setControlsPanelEnabled] = useState(true);
+	const [commandCenterLocation, setCommandCenterLocation] = useState<CommandCenterLocation>(() =>
+		readCommandCenterLocation(localStorage.getItem("bloom-command-center-location"))
+	);
 	const [devicesPanelEnabled, setDevicesPanelEnabled] = useState(false);
 	const [timerSoundEnabled, setTimerSoundEnabled] = useState(
 		() => localStorage.getItem("bloom-timer-sound-enabled") !== "false"
@@ -217,6 +221,11 @@ export function useSettings() {
 			apply(getVal("bloom-calendar-enabled"), setCalendarEnabled, readBool);
 			apply(getVal("bloom-calendar-monday-first"), setCalendarMondayFirst, readBool);
 			apply(getVal("bloom-notch-command-center-enabled"), setControlsPanelEnabled, readBool);
+			apply(
+				getVal("bloom-command-center-location"),
+				setCommandCenterLocation,
+				readCommandCenterLocation
+			);
 			apply(getVal("bloom-notch-devices-enabled"), setDevicesPanelEnabled, readBool);
 			apply(getVal("bloom-timer-sound-enabled"), setTimerSoundEnabled, readBool);
 			apply(getVal("bloom-music-mode-enabled"), setMusicModeEnabled, readBool);
@@ -400,6 +409,10 @@ export function useSettings() {
 		"bloom-calendar-enabled": setCalendarEnabled,
 		"bloom-calendar-monday-first": setCalendarMondayFirst,
 		"bloom-notch-command-center-enabled": setControlsPanelEnabled,
+		"bloom-command-center-location": {
+			set: (v: unknown) => setCommandCenterLocation(readCommandCenterLocation(v)),
+			defaultValue: "dock"
+		},
 		"bloom-notch-devices-enabled": setDevicesPanelEnabled,
 		"bloom-timer-sound-enabled": setTimerSoundEnabled,
 		"bloom-music-mode-enabled": setMusicModeEnabled,
@@ -558,9 +571,30 @@ export function useSettings() {
 		saveSetting("bloom-weather-enabled", String(next));
 	};
 
+	// With the dock off there is no corner, so the Command Center shows in the notch.
+	const commandCenterInNotch = commandCenterLocation === "notch" || !dockEnabled;
+
 	// The notch needs at least one panel, so the last one on can't be turned off.
+	// The Command Center only counts while it lives in the notch.
 	const enabledPanelCount =
-		Number(calendarEnabled) + Number(controlsPanelEnabled) + Number(devicesPanelEnabled);
+		Number(calendarEnabled) +
+		Number(controlsPanelEnabled && commandCenterInNotch) +
+		Number(devicesPanelEnabled);
+
+	const changeCommandCenterLocation = (location: CommandCenterLocation) => {
+		setCommandCenterLocation(location);
+		saveSetting("bloom-command-center-location", location);
+		// Moving it to the notch means showing it there.
+		if (location === "notch" && !controlsPanelEnabled) {
+			setControlsPanelEnabled(true);
+			saveSetting("bloom-notch-command-center-enabled", "true");
+		}
+		// Without it the notch still needs a panel of its own.
+		if (location === "dock" && !calendarEnabled && !devicesPanelEnabled) {
+			setCalendarEnabled(true);
+			saveSetting("bloom-calendar-enabled", "true");
+		}
+	};
 
 	const toggleCalendarMondayFirst = () => {
 		const next = !calendarMondayFirst;
@@ -1037,6 +1071,9 @@ export function useSettings() {
 		toggleCalendar,
 		controlsPanelEnabled,
 		toggleControlsPanel,
+		commandCenterLocation,
+		changeCommandCenterLocation,
+		commandCenterInNotch,
 		devicesPanelEnabled,
 		toggleDevicesPanel,
 		enabledPanelCount,

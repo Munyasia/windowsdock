@@ -1,6 +1,6 @@
 import { motion, AnimatePresence, useAnimation } from "framer-motion";
 import { useEffect, useLayoutEffect, useState, useCallback, useMemo, useRef, memo } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { emitTo, listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getVersion } from "@tauri-apps/api/app";
@@ -27,7 +27,7 @@ import {
 import { CompactMediaPlayer } from "./CompactMediaPlayer";
 import { useWeather } from "./hooks/useWeather";
 import { useSettingsSync } from "./hooks/useSettingsSync";
-import { useTrailingThrottle } from "./hooks/useTrailingThrottle";
+import { useQuickControls } from "./hooks/useQuickControls";
 import { useAnnouncement } from "./hooks/useAnnouncement";
 import { reloadIfMirrorWasStale } from "./hooks/settingsMirror";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -38,6 +38,9 @@ import { EdgeSurface } from "./components/EdgeSurface";
 import { ShelfTypeIcon } from "./components/ShelfTypeIcon";
 import { WifiPanel } from "./components/WifiPanel";
 import { BluetoothPanel } from "./components/BluetoothPanel";
+import { CommandCenter, applyBarMode, nextBarMode } from "./components/CommandCenter";
+import { readCommandCenterLocation } from "./commandCenterLocation";
+import { BatteryIcon } from "./components/BatteryIcon";
 import { DeviceArt, DeviceArtDefs } from "./devices/DeviceArt";
 import { deviceArtFor } from "./devices/deviceArtFor";
 import { deviceLookFor } from "./devices/deviceLooks";
@@ -63,14 +66,7 @@ import {
 	ChevronRight,
 	Inbox,
 	Music,
-	Zap,
-	VolumeX,
-	Volume,
-	Volume1,
-	Volume2,
-	SunDim,
-	SunMedium,
-	Sun
+	Zap
 } from "lucide-react";
 
 /**
@@ -174,120 +170,6 @@ const playTimerChime = () => {
 		harmonic.stop(start + at + 1.5);
 	});
 };
-
-// Simple SVG icons
-function WifiIcon({ enabled, connected }: { enabled: boolean; connected: boolean }) {
-	return (
-		<svg
-			width="18"
-			height="18"
-			viewBox="0 0 24 24"
-			fill="none"
-			stroke="currentColor"
-			strokeWidth="2.5"
-			strokeLinecap="round"
-			strokeLinejoin="round"
-			opacity={!enabled ? 0.4 : connected ? 1 : 0.7}
-		>
-			<path d="M5 12.55a11 11 0 0 1 14.08 0" />
-			<path d="M1.42 9a16 16 0 0 1 21.16 0" />
-			<path d="M8.53 16.11a6 6 0 0 1 6.95 0" />
-			<line x1="12" y1="20" x2="12.01" y2="20" />
-		</svg>
-	);
-}
-
-function TrayIcon() {
-	return (
-		<svg
-			width="14"
-			height="14"
-			viewBox="0 0 24 24"
-			fill="none"
-			stroke="currentColor"
-			strokeWidth="2.5"
-			strokeLinecap="round"
-			strokeLinejoin="round"
-		>
-			<rect x="3" y="3" width="6" height="6" rx="1" />
-			<rect x="15" y="3" width="6" height="6" rx="1" />
-			<rect x="15" y="15" width="6" height="6" rx="1" />
-			<rect x="3" y="15" width="6" height="6" rx="1" />
-		</svg>
-	);
-}
-
-function BatteryIcon({
-	charging,
-	level,
-	threshold = 20
-}: {
-	charging: boolean;
-	level: number;
-	threshold?: number;
-}) {
-	const percentage = Math.min(Math.max(level, 0), 100);
-
-	return (
-		<div
-			style={{
-				display: "flex",
-				alignItems: "center",
-				position: "relative",
-				height: "14px",
-				justifyContent: "center"
-			}}
-		>
-			<svg width="20" height="10" viewBox="0 0 20 10" fill="none">
-				{/* Battery Shell - Centered at 9px within 20px width, ignoring the tip's offset */}
-				<rect
-					x="2"
-					y="0.75"
-					width="14"
-					height="8.5"
-					rx="2.4"
-					stroke="currentColor"
-					strokeOpacity={0.35}
-					strokeWidth="1.1"
-				/>
-				{/* Battery Tip */}
-				<path
-					d="M17.5 3.5V6.5"
-					stroke="currentColor"
-					strokeOpacity={0.35}
-					strokeWidth="1.2"
-					strokeLinecap="round"
-				/>
-				{/* Fill */}
-				<rect
-					x="3.8"
-					y="2.5"
-					width={Math.max(0.5, (percentage / 100) * 10.4)}
-					height="5"
-					rx="1"
-					fill={charging ? "#32D74B" : percentage <= threshold ? "#FF453A" : "white"}
-				/>
-			</svg>
-			{/* Charging Bolt - Centered on the battery body */}
-			{charging && (
-				<div
-					style={{
-						position: "absolute",
-						top: "50%",
-						left: "9px",
-						transform: "translate(-50%, -50%)",
-						color: "white",
-						filter: "drop-shadow(0px 0px 1.5px rgba(0,0,0,0.8))"
-					}}
-				>
-					<svg width="7" height="10" viewBox="0 0 8 12" fill="currentColor">
-						<path d="M4.5 0L0 7H3.5L2.5 12L8 5H4.5L5.5 0H4.5Z" />
-					</svg>
-				</div>
-			)}
-		</div>
-	);
-}
 
 function GreenDownArrowIcon() {
 	return (
@@ -418,12 +300,6 @@ interface MediaInfo {
 	duration_ms?: number;
 	seek_enabled?: boolean;
 	position_updated_at?: number;
-}
-
-interface WifiStatus {
-	enabled: boolean;
-	connected: boolean;
-	ssid: string | null;
 }
 
 // A shelf file's preview from the backend: a picture when one can be made,
@@ -717,22 +593,6 @@ function App() {
 	});
 	const [albumArtUrl, setAlbumArtUrl] = useState<string | null>(null);
 	const [albumArtKey, setAlbumArtKey] = useState(0);
-	const [volume, setVolume] = useState(0.5);
-	const [isMuted, setIsMuted] = useState(false);
-	// Sliders show 0 while muted, matching the overlay HUD.
-	const displayVolume = isMuted ? 0 : volume;
-	// Null until the first successful fetch so the pill can't flash a wrong
-	// default on startup.
-	const [wifiStatus, setWifiStatus] = useState<WifiStatus | null>(null);
-	const wifiEnabled = wifiStatus?.enabled ?? false;
-	const wifiConnected = wifiStatus?.connected ?? false;
-	const [bluetoothEnabled, setBluetoothEnabled] = useState(true);
-	// Names of connected Bluetooth devices, for the controls tile.
-	const [btConnectedNames, setBtConnectedNames] = useState<string[]>([]);
-	const [batterySaverEnabled, setBatterySaverEnabled] = useState(false);
-	const [currentBrightness, setCurrentBrightness] = useState(50);
-	const previousVolume = useRef(0.5);
-	const previousBrightness = useRef(50);
 	const [calendarMonth, setCalendarMonth] = useState(() => {
 		const now = new Date();
 		return new Date(now.getFullYear(), now.getMonth(), 1);
@@ -1073,6 +933,12 @@ function App() {
 	const [settingsControlsPanelEnabled, setSettingsControlsPanelEnabled] = useState(
 		() => localStorage.getItem("bloom-notch-command-center-enabled") !== "false"
 	);
+	// The Command Center lives in the dock's corner unless Settings puts it in
+	// the notch. With the dock off there is no corner, so it stays here.
+	const [commandCenterLocation, setCommandCenterLocation] = useState(() =>
+		readCommandCenterLocation(localStorage.getItem("bloom-command-center-location"))
+	);
+	const commandCenterInNotch = commandCenterLocation === "notch" || !dockEnabled;
 	const [settingsDevicesPanelEnabled, setSettingsDevicesPanelEnabled] = useState(
 		() => localStorage.getItem("bloom-notch-devices-enabled") === "true"
 	);
@@ -1156,6 +1022,9 @@ function App() {
 				setCalendarMondayFirst(getVal("bloom-calendar-monday-first", "false") === "true");
 				setSettingsControlsPanelEnabled(
 					getVal("bloom-notch-command-center-enabled", "true") !== "false"
+				);
+				setCommandCenterLocation(
+					readCommandCenterLocation(getVal("bloom-command-center-location", "dock"))
 				);
 				setSettingsDevicesPanelEnabled(getVal("bloom-notch-devices-enabled", "false") === "true");
 				setSettingsTimerSoundEnabled(getVal("bloom-timer-sound-enabled", "true") !== "false");
@@ -1278,6 +1147,10 @@ function App() {
 			"bloom-calendar-enabled": setSettingsCalendarEnabled,
 			"bloom-calendar-monday-first": setCalendarMondayFirst,
 			"bloom-notch-command-center-enabled": setSettingsControlsPanelEnabled,
+			"bloom-command-center-location": {
+				set: (value: unknown) => setCommandCenterLocation(readCommandCenterLocation(value)),
+				defaultValue: "dock"
+			},
 			"bloom-notch-devices-enabled": setSettingsDevicesPanelEnabled,
 			"bloom-timer-sound-enabled": setSettingsTimerSoundEnabled,
 			"bloom-music-mode-enabled": setSettingsMusicModeEnabled,
@@ -1408,6 +1281,15 @@ function App() {
 
 	// Bloom mode state: 'music', 'calendar', 'command-center', 'announcement', 'shelf', or 'status'
 	const [bloomMode, setBloomMode] = useState<BloomMode>("status");
+
+	// Wi-Fi, Bluetooth, volume, brightness and Energy Saver, shared with the
+	// dock's copy of the Command Center. Volume also drives the media player
+	// and Energy Saver the battery widget, so both stay live here.
+	const quickControls = useQuickControls({
+		panelOpen: bloomMode === "command-center",
+		watchBatterySaver: true
+	});
+	const { displayVolume, handleVolumeChange, batterySaverEnabled } = quickControls;
 
 	// Shelf: files and selected text stashed in the notch via drag-and-drop.
 	// Files are stored as plain paths (references, never copies). Session-scoped
@@ -1928,14 +1810,16 @@ function App() {
 
 	function panelEnabled(panel: NotchPanel) {
 		if (panel === "calendar") return settingsCalendarEnabled;
-		if (panel === "command-center") return settingsControlsPanelEnabled;
+		if (panel === "command-center") return settingsControlsPanelEnabled && commandCenterInNotch;
 		return settingsDevicesPanelEnabled;
 	}
 
 	// Settings keeps at least one panel on; if a hand-edited settings file turns
-	// them all off, Controls stays so the open notch is never empty.
+	// them all off, Controls stays so the open notch is never empty. With
+	// Controls in the dock, the calendar takes that place.
+	const fallbackPanel: NotchPanel = commandCenterInNotch ? "command-center" : "calendar";
 	function panelAvailable(panel: NotchPanel) {
-		if (!NOTCH_PANELS.some(panelEnabled)) return panel === "command-center";
+		if (!NOTCH_PANELS.some(panelEnabled)) return panel === fallbackPanel;
 		return panelEnabled(panel);
 	}
 
@@ -2169,8 +2053,19 @@ function App() {
 	const openingPanel = (): NotchPanel => {
 		const preferred = rememberPanelEnabled ? lastPanel ?? defaultPanel : defaultPanel;
 		if (panelAvailable(preferred)) return preferred;
-		return NOTCH_PANELS.find(panelAvailable) ?? "command-center";
+		return NOTCH_PANELS.find(panelAvailable) ?? fallbackPanel;
 	};
+
+	// Moving the Command Center to the dock takes it, and the Wi-Fi and
+	// Bluetooth views it opens, out of an open notch.
+	useEffect(() => {
+		if (commandCenterInNotch) return;
+		if (bloomMode === "command-center" || bloomMode === "wifi" || bloomMode === "bluetooth") {
+			setBloomMode(openingPanel());
+		}
+		// openingPanel reads current state; it only matters when the location changes.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [commandCenterInNotch, bloomMode]);
 
 	// Expands the notch into a panel, or into an activity's own view.
 	const openNotch = (view: NotchPanel | "music" | "shelf") => {
@@ -2448,123 +2343,6 @@ function App() {
 		initBattery();
 	}, []);
 
-	// Listen for Volume Changes
-	useEffect(() => {
-		const unlisten = listen<{ volume: number; is_muted: boolean }>("volume-change", (event) => {
-			setVolume(event.payload.volume);
-			setIsMuted(event.payload.is_muted);
-		});
-		return () => {
-			unlisten.then((fn) => fn());
-		};
-	}, []);
-
-	// Wi-Fi is a three-state control: Off, on-but-not-connected, Connected.
-	// The radio state alone can't tell those apart, so get_wifi_status returns
-	// both flags, plus the connected network's name. Returns false so the startup loader knows to retry.
-	const refreshWifiStatus = useCallback(async (): Promise<boolean> => {
-		try {
-			setWifiStatus(await invoke<WifiStatus>("get_wifi_status"));
-			return true;
-		} catch {
-			return false;
-		}
-	}, []);
-
-	// Seed the Wi-Fi pill at startup. The first call can fail while the WLAN
-	// service is still coming up, so retry instead of leaving the pill stuck on
-	// its default.
-	useEffect(() => {
-		let cancelled = false;
-		let retryTimer: ReturnType<typeof setTimeout> | undefined;
-		const initializeWifiStatus = async (attempt: number) => {
-			const loaded = await refreshWifiStatus();
-			if (!loaded && !cancelled && attempt < 3) {
-				retryTimer = setTimeout(() => void initializeWifiStatus(attempt + 1), (attempt + 1) * 1000);
-			}
-		};
-		void initializeWifiStatus(0);
-		return () => {
-			cancelled = true;
-			if (retryTimer) clearTimeout(retryTimer);
-		};
-	}, [refreshWifiStatus]);
-
-	// Connected Bluetooth devices for the tile, refreshed whenever the backend
-	// reports a device connecting, disconnecting, pairing or being removed.
-	useEffect(() => {
-		if (!bluetoothEnabled) {
-			setBtConnectedNames([]);
-			return;
-		}
-		const refresh = () =>
-			invoke<{ name: string; connected: boolean }[]>("bluetooth_list_devices")
-				.then((devices) =>
-					setBtConnectedNames(devices.filter((d) => d.connected).map((d) => d.name))
-				)
-				.catch(() => {});
-		let debounce: ReturnType<typeof setTimeout> | undefined;
-		void refresh();
-		const unlisten = listen("bluetooth-changed", () => {
-			clearTimeout(debounce);
-			debounce = setTimeout(() => void refresh(), 400);
-		});
-		return () => {
-			clearTimeout(debounce);
-			unlisten.then((f) => f());
-		};
-	}, [bluetoothEnabled]);
-
-	// The backend reports connection changes and finished scans as they
-	// happen, so the pill follows without waiting for the next poll.
-	useEffect(() => {
-		let debounce: ReturnType<typeof setTimeout> | undefined;
-		const unlisten = listen("wifi-changed", () => {
-			clearTimeout(debounce);
-			debounce = setTimeout(() => void refreshWifiStatus(), 300);
-		});
-		return () => {
-			clearTimeout(debounce);
-			unlisten.then((f) => f());
-		};
-	}, [refreshWifiStatus]);
-
-	// Load bluetooth/volume/brightness state on mount
-	useEffect(() => {
-		invoke<boolean>("get_bluetooth_state")
-			.then(setBluetoothEnabled)
-			.catch(() => {});
-		invoke<boolean>("get_battery_saver_state")
-			.then(setBatterySaverEnabled)
-			.catch(() => {});
-		invoke<{ volume: number; is_muted: boolean }>("get_volume_state")
-			.then((state) => {
-				setVolume(state.volume);
-				setIsMuted(state.is_muted);
-			})
-			.catch(() => {});
-		invoke<number>("get_brightness")
-			.then(setCurrentBrightness)
-			.catch(() => {});
-
-		// Poll battery saver state every 5s (since we can't listen for changes)
-		const interval = setInterval(() => {
-			invoke<boolean>("get_battery_saver_state")
-				.then(setBatterySaverEnabled)
-				.catch(() => {});
-		}, 5000);
-		return () => clearInterval(interval);
-	}, []);
-
-	// Refresh Wi-Fi status while the command center is open so changes made
-	// outside Bloom (keyboard toggle, Windows quick settings) show up.
-	useEffect(() => {
-		if (bloomMode !== "command-center") return;
-		void refreshWifiStatus();
-		const interval = setInterval(() => void refreshWifiStatus(), 5000);
-		return () => clearInterval(interval);
-	}, [bloomMode, refreshWifiStatus]);
-
 	// Poll system metrics for status widgets
 	useEffect(() => {
 		const fetchMetrics = () => {
@@ -2587,16 +2365,6 @@ function App() {
 		fetchMetrics();
 		const interval = setInterval(fetchMetrics, 3000);
 		return () => clearInterval(interval);
-	}, []);
-
-	// Listen for brightness changes
-	useEffect(() => {
-		const unlisten = listen<{ brightness: number }>("brightness-change", (event) => {
-			setCurrentBrightness(event.payload.brightness);
-		});
-		return () => {
-			unlisten.then((fn) => fn());
-		};
 	}, []);
 
 	// Native Windows Media Controls - Listen for updates from background worker
@@ -2697,67 +2465,6 @@ function App() {
 		skipNext();
 	}, [skipNext, nextFront, nextBack]);
 
-	const sendVolume = useTrailingThrottle((newVol: number) => {
-		invoke("set_volume", { volume: newVol }).catch(() => {});
-	}, 50);
-
-	const handleVolumeChange = useCallback(
-		(newVol: number) => {
-			if (volume > 0 && !isMuted) previousVolume.current = volume;
-			setVolume(newVol);
-			// set_volume unmutes for any non-zero level.
-			setIsMuted(newVol === 0);
-			sendVolume(newVol);
-		},
-		[sendVolume, volume, isMuted]
-	);
-	const CommandVolumeIcon =
-		displayVolume === 0
-			? VolumeX
-			: displayVolume < 0.33
-				? Volume
-				: displayVolume < 0.67
-					? Volume1
-					: Volume2;
-	const CommandBrightnessIcon =
-		currentBrightness < 34 ? SunDim : currentBrightness < 67 ? SunMedium : Sun;
-	const toggleVolumeLevel = () => {
-		handleVolumeChange(
-			displayVolume > 0 ? 0 : isMuted && volume > 0 ? volume : previousVolume.current
-		);
-	};
-
-	// WiFi toggle
-	const toggleWifi = useCallback(async () => {
-		const previous = wifiStatus;
-		const newState = !(previous?.enabled ?? false);
-		setWifiStatus({
-			enabled: newState,
-			connected: newState ? (previous?.connected ?? false) : false,
-			ssid: newState ? (previous?.ssid ?? null) : null
-		});
-		try {
-			await invoke("set_wifi_state", { enabled: newState });
-			// The radio and association take a moment to settle.
-			setTimeout(() => void refreshWifiStatus(), 800);
-		} catch (e) {
-			setWifiStatus(previous);
-			console.error("Failed to toggle WiFi:", e);
-		}
-	}, [wifiStatus, refreshWifiStatus]);
-
-	// Bluetooth toggle
-	const toggleBluetooth = useCallback(async () => {
-		const newState = !bluetoothEnabled;
-		setBluetoothEnabled(newState);
-		try {
-			await invoke("set_bluetooth_state", { enabled: newState });
-		} catch (e) {
-			setBluetoothEnabled(!newState);
-			console.error("Failed to toggle Bluetooth:", e);
-		}
-	}, [bluetoothEnabled]);
-
 	// The notch never takes focus, and native `title` tooltips only show for an
 	// active window, so the status widgets draw their own. A tooltip opens
 	// after a tooltip-like delay, by which time the battery details fetched on
@@ -2829,94 +2536,25 @@ function App() {
 			.catch((err) => console.error("Failed to read battery details:", err));
 	}, []);
 
-	// Battery Saver - opens settings (no public API to toggle without admin)
-	const openBatterySaverSettings = useCallback(async () => {
-		try {
-			await invoke("open_battery_saver_settings");
-		} catch (e) {
-			console.error("Failed to open Battery Saver settings:", e);
-		}
-	}, []);
-
-	// Brightness change with throttling
-	const sendBrightness = useTrailingThrottle((newVal: number) => {
-		invoke("set_brightness", { brightness: newVal }).catch(() => {});
-	}, 50);
-
-	const handleBrightnessChange = useCallback(
-		(newVal: number) => {
-			if (currentBrightness > 0) previousBrightness.current = currentBrightness;
-			setCurrentBrightness(newVal);
-			sendBrightness(newVal);
-		},
-		[sendBrightness, currentBrightness]
-	);
-	const toggleBrightnessLevel = () => {
-		handleBrightnessChange(currentBrightness > 0 ? 0 : previousBrightness.current);
-	};
-
-	// Open system tray (unhide taskbar and invoke Win+B)
-	const openSystemTray = useCallback(async (e: React.MouseEvent) => {
-		e.stopPropagation();
-		try {
-			await invoke("open_system_tray");
-		} catch (e) {
-			console.error("Failed to open system tray:", e);
-		}
-	}, []);
-
-	const openSettingsWindow = useCallback(async () => {
-		try {
-			await invoke("open_settings_window");
-		} catch (e) {
-			console.error("Failed to open settings window:", e);
-		}
-	}, []);
-
-	// Right-click opens the tile's own view, the same as its › button.
-	const handleWifiRightClick = useCallback((e: React.MouseEvent) => {
-		e.preventDefault();
-		e.stopPropagation();
-		setBloomMode("wifi");
-	}, []);
-
 	const toggleDockModeSetting = useCallback(
-		async (e: React.MouseEvent) => {
+		(e: React.MouseEvent) => {
 			e.stopPropagation();
-			const nextMode = dockMode === "fixed" ? "smart" : dockMode === "smart" ? "peek" : "fixed";
+			const nextMode = nextBarMode(dockMode);
 			setDockMode(nextMode);
-			localStorage.setItem("bloom-dock-mode", nextMode);
-			invoke("save_setting", { key: "bloom-dock-mode", value: nextMode }).catch(console.error);
-			try {
-				await invoke("change_dock_mode", { mode: nextMode });
-			} catch (err) {
-				console.error("Failed to change dock mode:", err);
-			}
+			void applyBarMode("dock", nextMode);
 		},
 		[dockMode]
 	);
 
 	const toggleNotchModeSetting = useCallback(
-		async (e: React.MouseEvent) => {
+		(e: React.MouseEvent) => {
 			e.stopPropagation();
-			const nextMode = notchMode === "fixed" ? "smart" : notchMode === "smart" ? "peek" : "fixed";
+			const nextMode = nextBarMode(notchMode);
 			setNotchMode(nextMode);
-			localStorage.setItem("bloom-notch-mode", nextMode);
-			invoke("save_setting", { key: "bloom-notch-mode", value: nextMode }).catch(console.error);
-			try {
-				await invoke("change_notch_mode", { mode: nextMode });
-			} catch (err) {
-				console.error("Failed to change notch mode:", err);
-			}
+			void applyBarMode("notch", nextMode);
 		},
 		[notchMode]
 	);
-
-	const handleBluetoothRightClick = useCallback((e: React.MouseEvent) => {
-		e.preventDefault();
-		e.stopPropagation();
-		setBloomMode("bluetooth");
-	}, []);
 
 	const toggleCalendarMode = (e: React.MouseEvent) => {
 		e.stopPropagation();
@@ -3861,8 +3499,8 @@ function App() {
 											transition={{ type: "spring", stiffness: 400, damping: 30 }}
 										>
 											<WifiPanel
-												enabled={wifiEnabled}
-												onToggle={toggleWifi}
+												enabled={quickControls.wifiEnabled}
+												onToggle={quickControls.toggleWifi}
 												onBack={() => setBloomMode("command-center")}
 												onPinChange={setNotchPinned}
 											/>
@@ -3881,8 +3519,8 @@ function App() {
 											transition={{ type: "spring", stiffness: 400, damping: 30 }}
 										>
 											<BluetoothPanel
-												enabled={bluetoothEnabled}
-												onToggle={toggleBluetooth}
+												enabled={quickControls.bluetoothEnabled}
+												onToggle={quickControls.toggleBluetooth}
 												onBack={() => setBloomMode("command-center")}
 												onPinChange={setNotchPinned}
 											/>
@@ -3922,273 +3560,15 @@ function App() {
 											exit={{ opacity: 0, filter: "blur(4px)", transition: { duration: 0.1 } }}
 											transition={{ type: "spring", stiffness: 400, damping: 30 }}
 										>
-											{/* Pills Grid */}
-											<div className="cc-pills-grid">
-												{/* Wi-Fi Pill */}
-												<div
-													className={`cc-pill-tile ${wifiEnabled ? "active" : ""}`}
-													onClick={(e) => {
-														e.stopPropagation();
-														toggleWifi();
-													}}
-													onContextMenu={handleWifiRightClick}
-													title="Left-click to toggle, Right-click for networks"
-												>
-													<div className="cc-pill-icon-wrapper">
-														<WifiIcon enabled={wifiEnabled} connected={wifiConnected} />
-													</div>
-													<div className="cc-pill-info">
-														<span className="cc-pill-title">Wi-Fi</span>
-														<span className="cc-pill-status">
-															{wifiStatus === null
-																? "…"
-																: !wifiEnabled
-																	? "Off"
-																	: wifiConnected
-																		? (wifiStatus?.ssid ?? "Connected")
-																		: "Not connected"}
-														</span>
-													</div>
-													<button
-														className="cc-pill-more"
-														aria-label="Wi-Fi networks"
-														title="Wi-Fi networks"
-														onClick={(e) => {
-															e.stopPropagation();
-															setBloomMode("wifi");
-														}}
-													>
-														<ChevronRight />
-													</button>
-												</div>
-
-												{/* Dock Mode Pill */}
-												<div
-													className={`cc-pill-tile ${dockMode === "fixed" ? "active" : ""}`}
-													onClick={toggleDockModeSetting}
-													title="Cycle dock mode: Fixed / Smart / Peek"
-												>
-													<div className="cc-pill-icon-wrapper">
-														<DockIcon />
-													</div>
-													<div className="cc-pill-info">
-														<span className="cc-pill-title">Dock Mode</span>
-														<span className="cc-pill-status">
-															{dockMode === "fixed"
-																? "Fixed"
-																: dockMode === "smart"
-																	? "Smart"
-																	: "Peek"}
-														</span>
-													</div>
-												</div>
-
-												{/* Bluetooth Pill */}
-												<div
-													className={`cc-pill-tile ${bluetoothEnabled ? "active" : ""}`}
-													onClick={(e) => {
-														e.stopPropagation();
-														toggleBluetooth();
-													}}
-													onContextMenu={handleBluetoothRightClick}
-													title="Left-click to toggle, Right-click for devices"
-												>
-													<div className="cc-pill-icon-wrapper">
-														<BluetoothIcon />
-													</div>
-													<div className="cc-pill-info">
-														<span className="cc-pill-title">Bluetooth</span>
-														<span className="cc-pill-status">
-															{!bluetoothEnabled
-																? "Off"
-																: btConnectedNames.length === 1
-																	? btConnectedNames[0]
-																	: btConnectedNames.length > 1
-																		? `${btConnectedNames.length} connected`
-																		: "On"}
-														</span>
-													</div>
-													<button
-														className="cc-pill-more"
-														aria-label="Bluetooth devices"
-														title="Bluetooth devices"
-														onClick={(e) => {
-															e.stopPropagation();
-															setBloomMode("bluetooth");
-														}}
-													>
-														<ChevronRight />
-													</button>
-												</div>
-
-												{/* Notch Mode Pill */}
-												<div
-													className={`cc-pill-tile ${notchMode === "fixed" ? "active" : ""}`}
-													onClick={toggleNotchModeSetting}
-													title="Cycle notch mode: Fixed / Smart / Peek"
-												>
-													<div className="cc-pill-icon-wrapper">
-														<NotchIcon />
-													</div>
-													<div className="cc-pill-info">
-														<span className="cc-pill-title">Notch Mode</span>
-														<span className="cc-pill-status">
-															{notchMode === "fixed"
-																? "Fixed"
-																: notchMode === "smart"
-																	? "Smart"
-																	: "Peek"}
-														</span>
-													</div>
-												</div>
-											</div>
-
-											{/* Circular Actions Row */}
-											<div className="cc-circular-actions-row">
-												<button
-													className="cc-circular-btn"
-													onClick={(e) => {
-														e.stopPropagation();
-														invoke("open_app", { appName: "ms-settings:notifications" }).catch(
-															console.error
-														);
-													}}
-													title="Do Not Disturb — Open Windows notification settings"
-												>
-													<MoonIcon />
-												</button>
-												<button
-													className={`cc-circular-btn ${batterySaverEnabled ? "active" : ""}`}
-													onClick={(e) => {
-														e.stopPropagation();
-														openBatterySaverSettings();
-													}}
-													title={`Energy Saver: ${batterySaverEnabled ? "On" : "Off"} — Click to open Settings`}
-												>
-													<BatterySaverIcon />
-												</button>
-												<button
-													className="cc-circular-btn"
-													onClick={(e) => {
-														e.stopPropagation();
-														openSystemTray(e);
-													}}
-													title="System Tray"
-												>
-													<TrayIcon />
-												</button>
-												<button
-													className="cc-circular-btn"
-													onClick={(e) => {
-														e.stopPropagation();
-														invoke("open_notification_center");
-													}}
-													title="Notification Center"
-												>
-													<BellIcon />
-												</button>
-												<button
-													className="cc-circular-btn"
-													onClick={(e) => {
-														e.stopPropagation();
-														openSettingsWindow();
-													}}
-													title="Bloom Settings"
-												>
-													<SettingsIcon />
-												</button>
-												<button
-													className="cc-circular-btn"
-													onClick={(e) => {
-														e.stopPropagation();
-														invoke("restart_bloom");
-													}}
-													title="Restart Bloom"
-												>
-													<ReloadIcon />
-												</button>
-											</div>
-
-											{/* Classic Sliders Area */}
-											<div className="cc-classic-sliders-area">
-												{/* Volume Slider */}
-												<div className="cc-classic-slider-row">
-													<div className="cc-classic-slider-label">
-														<button
-															type="button"
-															className="cc-level-toggle"
-															onClick={toggleVolumeLevel}
-															aria-label={displayVolume > 0 ? "Mute volume" : "Restore volume"}
-															aria-pressed={displayVolume === 0}
-															title={displayVolume > 0 ? "Mute volume" : "Restore volume"}
-														>
-															<CommandVolumeIcon />
-														</button>
-														<span>Volume</span>
-													</div>
-													<div className="cc-classic-slider-track">
-														<input
-															type="range"
-															min="0"
-															max="1"
-															step="0.01"
-															aria-label="Volume"
-															value={displayVolume}
-															onChange={(e) => handleVolumeChange(parseFloat(e.target.value))}
-															onPointerDown={(e) => e.stopPropagation()}
-															onClick={(e) => e.stopPropagation()}
-															className="cc-classic-input"
-														/>
-														<div
-															className="cc-classic-fill"
-															style={{ width: `${displayVolume * 100}%` }}
-														/>
-													</div>
-													<span className="cc-classic-percentage">
-														{Math.round(displayVolume * 100)}%
-													</span>
-												</div>
-
-												{/* Brightness Slider */}
-												<div className="cc-classic-slider-row">
-													<div className="cc-classic-slider-label">
-														<button
-															type="button"
-															className="cc-level-toggle"
-															onClick={toggleBrightnessLevel}
-															aria-label={
-																currentBrightness > 0 ? "Minimize brightness" : "Restore brightness"
-															}
-															aria-pressed={currentBrightness === 0}
-															title={
-																currentBrightness > 0 ? "Minimize brightness" : "Restore brightness"
-															}
-														>
-															<CommandBrightnessIcon />
-														</button>
-														<span>Brightness</span>
-													</div>
-													<div className="cc-classic-slider-track">
-														<input
-															type="range"
-															min="0"
-															max="100"
-															step="1"
-															aria-label="Brightness"
-															value={currentBrightness}
-															onChange={(e) => handleBrightnessChange(parseInt(e.target.value))}
-															onPointerDown={(e) => e.stopPropagation()}
-															onClick={(e) => e.stopPropagation()}
-															className="cc-classic-input"
-														/>
-														<div
-															className="cc-classic-fill"
-															style={{ width: `${currentBrightness}%` }}
-														/>
-													</div>
-													<span className="cc-classic-percentage">{currentBrightness}%</span>
-												</div>
-											</div>
+											<CommandCenter
+												controls={quickControls}
+												dockMode={dockMode}
+												notchMode={notchMode}
+												onCycleDockMode={toggleDockModeSetting}
+												onCycleNotchMode={toggleNotchModeSetting}
+												onOpenWifi={() => setBloomMode("wifi")}
+												onOpenBluetooth={() => setBloomMode("bluetooth")}
+											/>
 										</motion.div>
 									)}
 								</AnimatePresence>
@@ -4211,6 +3591,11 @@ function App() {
 												// Bluetooth devices open their list; USB ones
 												// have none, so the click just dismisses.
 												if (usb) return;
+												// The list lives with the Command Center.
+												if (!commandCenterInNotch) {
+													void emitTo("dock", "dock-command-center-open", "bluetooth");
+													return;
+												}
 												setIsOpen(true);
 												setBloomMode("bluetooth");
 											}}
@@ -4590,152 +3975,6 @@ function App() {
 				</AnimatePresence>
 			</div>
 		</div>
-	);
-}
-
-function BluetoothIcon() {
-	return (
-		<svg
-			width="18"
-			height="18"
-			viewBox="0 0 24 24"
-			fill="none"
-			stroke="currentColor"
-			strokeWidth="2.5"
-			strokeLinecap="round"
-			strokeLinejoin="round"
-		>
-			<path d="M6.5 6.5l11 11L12 23V1l5.5 5.5-11 11" />
-		</svg>
-	);
-}
-
-function SettingsIcon() {
-	return (
-		<svg
-			width="14"
-			height="14"
-			viewBox="0 0 24 24"
-			fill="none"
-			stroke="currentColor"
-			strokeWidth="2.5"
-			strokeLinecap="round"
-			strokeLinejoin="round"
-			style={{ opacity: 0.9 }}
-		>
-			<circle cx="12" cy="12" r="3" />
-			<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-		</svg>
-	);
-}
-
-function MoonIcon() {
-	return (
-		<svg
-			width="18"
-			height="18"
-			viewBox="0 0 24 24"
-			fill="none"
-			stroke="currentColor"
-			strokeWidth="2.5"
-			strokeLinecap="round"
-			strokeLinejoin="round"
-		>
-			<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
-		</svg>
-	);
-}
-
-function DockIcon() {
-	return (
-		<svg
-			width="18"
-			height="18"
-			viewBox="0 0 24 24"
-			fill="none"
-			stroke="currentColor"
-			strokeWidth="2.5"
-			strokeLinecap="round"
-			strokeLinejoin="round"
-		>
-			<rect x="2" y="14" width="20" height="8" rx="2" />
-			<line x1="6" y1="18" x2="6.01" y2="18" strokeWidth="3.5" strokeLinecap="round" />
-			<line x1="10" y1="18" x2="10.01" y2="18" strokeWidth="3.5" strokeLinecap="round" />
-			<line x1="14" y1="18" x2="14.01" y2="18" strokeWidth="3.5" strokeLinecap="round" />
-			<line x1="18" y1="18" x2="18.01" y2="18" strokeWidth="3.5" strokeLinecap="round" />
-		</svg>
-	);
-}
-
-function NotchIcon() {
-	return (
-		<svg
-			width="18"
-			height="18"
-			viewBox="0 0 24 24"
-			fill="none"
-			stroke="currentColor"
-			strokeWidth="2.5"
-			strokeLinecap="round"
-			strokeLinejoin="round"
-		>
-			<path d="M4 3h16a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z" />
-			<path d="M9 9v4a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2V9" />
-		</svg>
-	);
-}
-
-function BellIcon() {
-	return (
-		<svg
-			width="14"
-			height="14"
-			viewBox="0 0 24 24"
-			fill="none"
-			stroke="currentColor"
-			strokeWidth="2.5"
-			strokeLinecap="round"
-			strokeLinejoin="round"
-		>
-			<path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9z" />
-			<path d="M13.73 21a2 2 0 0 1-3.46 0" />
-		</svg>
-	);
-}
-
-function ReloadIcon() {
-	return (
-		<svg
-			width="14"
-			height="14"
-			viewBox="0 0 24 24"
-			fill="none"
-			stroke="currentColor"
-			strokeWidth="2.5"
-			strokeLinecap="round"
-			strokeLinejoin="round"
-		>
-			<path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67" />
-		</svg>
-	);
-}
-
-function BatterySaverIcon() {
-	return (
-		<svg
-			width="18"
-			height="18"
-			viewBox="0 0 24 24"
-			fill="none"
-			stroke="currentColor"
-			strokeWidth="2.5"
-			strokeLinecap="round"
-			strokeLinejoin="round"
-		>
-			<rect x="2" y="7" width="16" height="10" rx="2" />
-			<path d="M22 11v2" />
-			<path d="M6 12h4l2-3v6l-2-3H6" />
-		</svg>
 	);
 }
 
