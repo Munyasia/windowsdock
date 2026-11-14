@@ -139,7 +139,12 @@ const fileOf = (p: string) =>
 
 // Shell application ids (AUMIDs) identify one specific app; two different PWAs
 // running in the same browser must never be matched by their shared exe name.
-const isIdentifier = (p: string) => !p.includes("/") && !p.includes("\\");
+// A bare executable name ("notepad.exe", the default Notepad pin) is a file,
+// not an id, as the backend's is_aumid_path treats it. Taking it for an id made
+// it unmatchable against Windows 11 Notepad, whose window reports its package
+// AUMID, so the running window got a second dock icon beside the pin.
+const isIdentifier = (p: string) =>
+	!p.includes("/") && !p.includes("\\") && !p.toLowerCase().endsWith(".exe");
 
 // Resolve the configured start-button icon to a public asset, or to the data
 // URI of a user-uploaded icon (stored with a "custom:" prefix).
