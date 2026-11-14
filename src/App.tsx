@@ -26,6 +26,7 @@ import {
 } from "./icons";
 import { CompactMediaPlayer } from "./CompactMediaPlayer";
 import { useWeather } from "./hooks/useWeather";
+import { formatNotchDate } from "./notchDate";
 import { useSettingsSync } from "./hooks/useSettingsSync";
 import { useQuickControls } from "./hooks/useQuickControls";
 import { useAnnouncement } from "./hooks/useAnnouncement";
@@ -92,6 +93,9 @@ const DEVICES_MAX_HEIGHT = 300;
 
 // Pomodoro timer limit.
 const MAX_TIMER_SECONDS = 180 * 60;
+
+// Space between the date and the clock; matches .time-center.has-date's gap.
+const NOTCH_DATE_GAP = 8;
 
 // Accept both mm:ss and compact digits ("130" -> 1:30).
 const timerDigitsToSeconds = (value: string): number | null => {
@@ -498,6 +502,10 @@ function App() {
 	}, []);
 
 	const [time, setTime] = useState("");
+	const [notchDate, setNotchDate] = useState(() => formatNotchDate(new Date()));
+	// Measured each render, since the month name changes the date's width.
+	const [notchDateWidth, setNotchDateWidth] = useState(62);
+	const notchDateRef = useRef<HTMLSpanElement>(null);
 	const [isHovered, setIsHovered] = useState(false);
 	// Expanded into a panel by a click. Hover alone only peeks.
 	const [isOpen, setIsOpen] = useState(false);
@@ -2303,6 +2311,7 @@ function App() {
 					hour12: !timeFormat24h
 				})
 			);
+			setNotchDate(formatNotchDate(now));
 		};
 
 		updateTime();
@@ -2722,6 +2731,17 @@ function App() {
 	// The 24-hour clock is ~16px narrower than the 12-hour one.
 	const clock24hTrim = timeFormat24h ? 16 : 0;
 
+	// The date sits beside the clock whenever the pill shows the plain clock:
+	// at rest and while hovered for status widgets. A timer or music takes
+	// the pill without it.
+	const showNotchDate = bloomMode === "status" && !timerActive && !showCompactMusicIcons;
+	const notchDateExtra = showNotchDate ? notchDateWidth + NOTCH_DATE_GAP : 0;
+	// No deps: a late web font load is picked up by the next clock tick.
+	useLayoutEffect(() => {
+		const width = notchDateRef.current?.offsetWidth;
+		if (width && width !== notchDateWidth) setNotchDateWidth(width);
+	});
+
 	// Calculate width dynamically based on enabled features
 	const getDynamicWidth = () => {
 		if (bloomMode === "announcement" && announcement && !announcementDismissed) return 380;
@@ -2736,12 +2756,15 @@ function App() {
 		}
 		if (bloomMode === "status" && isHovered) {
 			const totalWidgets = statusWidgets.left.length + statusWidgets.right.length;
-			return Math.max(Math.min(200 + totalWidgets * 50, 380) - clock24hTrim, statusFitWidth);
+			return Math.max(
+				Math.min(200 + totalWidgets * 50, 380) - clock24hTrim + notchDateExtra,
+				statusFitWidth
+			);
 		}
 		if (isMusicMode && isOpen) return mediaLayout === "compact" ? 300 : 340;
 		if ((showPowerPulse || showLowBatteryPulse || showUpdatePulse) && !isHovered) return 200;
 
-		let w = 140 - clock24hTrim;
+		let w = 140 - clock24hTrim + notchDateExtra;
 		if (isMusicMode) {
 			if (settingsVisualizerEnabled && isPlaying) w += 30;
 			if (settingsAlbumArtEnabled) w += 30;
@@ -3318,7 +3341,10 @@ function App() {
 															</div>
 
 															{/* Center - Time (always visible) */}
-															<div className="time-center" ref={timeCenterRef}>
+															<div
+																className={`time-center${showNotchDate ? " has-date" : ""}${timeFormat24h ? " clock-24h" : ""}`}
+																ref={timeCenterRef}
+															>
 																<AnimatePresence>
 																	{showPanelArrows && (
 																		<motion.button
@@ -3339,6 +3365,15 @@ function App() {
 																		</motion.button>
 																	)}
 																</AnimatePresence>
+																{showNotchDate && (
+																	<span
+																		className="notch-date"
+																		ref={notchDateRef}
+																		onClick={toggleCalendarMode}
+																	>
+																		{notchDate}
+																	</span>
+																)}
 																<div className="time-flip-container" onClick={toggleCalendarMode}>
 																	<AnimatePresence initial={false}>
 																		{timerSeconds > 0 || isTimerFinished ? (

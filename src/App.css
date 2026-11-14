@@ -181,6 +181,49 @@ img {
 	position: relative;
 }
 
+/* The date and the clock read as one centred group. The gap matches
+   NOTCH_DATE_GAP in App.tsx, which sizes the pill around them. */
+.time-center.has-date {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
+/* The clock box is sized for "03:42 PM"; the 24-hour clock is 16px narrower
+   (clock24hTrim), so shrink the box too or the gap to the date looks wide. */
+.time-center.has-date.clock-24h .time-flip-container {
+	min-width: 44px;
+}
+
+/* Keep the update dot under the clock, not under the gap before it. */
+.time-center.has-date .update-dot {
+	left: auto;
+	right: 30px;
+	transform: translateX(50%);
+}
+
+.time-center.has-date.clock-24h .update-dot {
+	right: 22px;
+}
+
+.notch-date {
+	font-size: 13px;
+	font-weight: 500;
+	letter-spacing: 0.3px;
+	line-height: 1;
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+	color: var(--bloom-text-muted, rgba(255, 255, 255, 0.7));
+	cursor: pointer;
+	user-select: none;
+	-webkit-user-select: none;
+	transition: color 0.2s ease;
+}
+
+.notch-date:hover {
+	color: var(--bloom-text, white);
+}
+
 /* Shelf: OS file drag hovering over the notch (see onDragDropEvent in App.tsx) */
 .bloom.drag-hover {
 	outline: 2px dashed rgba(255, 255, 255, 0.75);

@@ -20,6 +20,7 @@ import type { useSettings } from "./useSettings";
 import type { SettingsTab } from "./types";
 import { PreviewMediaPlayer } from "./PreviewMediaPlayer";
 import { PreviewDock } from "./PreviewDock";
+import { formatNotchDate } from "../notchDate";
 import "../App.css";
 import "../Dock.css";
 import "../Overlay.css";
@@ -98,14 +99,16 @@ function NotchPreview({
 						? 230
 						: 270
 				: feature === "resting"
-					? Math.min(420, Math.max(300, 200 + widgets.length * 50 - (settings.timeFormat24h ? 16 : 0)))
-					: 180;
+					? Math.min(490, Math.max(370, 270 + widgets.length * 50 - (settings.timeFormat24h ? 16 : 0)))
+					: 250;
 	const lowBattery = 15 <= settings.lowBatteryThreshold;
-	const clock = new Date(2024, 0, 1, 15, 42).toLocaleTimeString([], {
+	const sampleTime = new Date(2024, 0, 1, 15, 42);
+	const clock = sampleTime.toLocaleTimeString([], {
 		hour: "2-digit",
 		minute: "2-digit",
 		hour12: !settings.timeFormat24h
 	});
+	const sampleDate = formatNotchDate(sampleTime);
 	const renderWidget = (id: string) => {
 		if (id === "weather")
 			return settings.weatherEnabled ? (
@@ -248,6 +251,7 @@ function NotchPreview({
 								)}
 							</div>
 							<div className="time-center settings-preview-time">
+								<span className="notch-date">{sampleDate}</span>
 								<span>{clock}</span>
 								{settings.showUpdateIndicator && (
 									<span className="settings-preview-update-dot" aria-label="Update indicator" />
