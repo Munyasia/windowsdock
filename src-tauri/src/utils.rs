@@ -280,15 +280,21 @@ pub fn secondary_taskbar_windows() -> Vec<windows::Win32::Foundation::HWND> {
     windows
 }
 
-pub fn any_native_taskbar_visible() -> bool {
+/// Whether a taskbar window is one the dock replaces. The dock lives on the
+/// primary monitor only, so it replaces only the primary taskbar
+/// (`Shell_TrayWnd`); the taskbars of other monitors (`Shell_SecondaryTrayWnd`)
+/// stay with Windows, or a second screen would have neither.
+pub fn is_dock_replaced_taskbar(class: &str) -> bool {
+    class == "Shell_TrayWnd"
+}
+
+/// Whether the primary taskbar, the one the dock replaces, is showing.
+pub fn primary_taskbar_visible() -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowA, IsWindowVisible};
     unsafe {
         let primary = windows::core::PCSTR(c"Shell_TrayWnd".as_ptr() as *const u8);
         FindWindowA(primary, windows::core::PCSTR::null())
             .is_ok_and(|hwnd| IsWindowVisible(hwnd).as_bool())
-            || secondary_taskbar_windows()
-                .into_iter()
-                .any(|hwnd| IsWindowVisible(hwnd).as_bool())
     }
 }
 
@@ -400,14 +406,6 @@ pub fn set_taskbar_visibility(visible: bool, always_on_top: bool) -> bool {
             if let Ok(mut guard) = ORIGINAL_TRAY_RECT.lock() {
                 if guard.is_none() {
                     *guard = placed_taskbar_rect(tray_hwnd);
-                }
-            }
-            if let Ok(mut guard) = ORIGINAL_SEC_TRAY_RECTS.lock() {
-                let rects = guard.get_or_insert_with(std::collections::HashMap::new);
-                for hwnd in &secondary_trays {
-                    if let Some(rect) = placed_taskbar_rect(*hwnd) {
-                        rects.entry(hwnd.0 as isize).or_insert(rect);
-                    }
                 }
             }
         }
@@ -544,67 +542,66 @@ pub fn set_taskbar_visibility(visible: bool, always_on_top: bool) -> bool {
             }
         }
 
-        // 3. Control every secondary taskbar (multi-monitor)
+        // 3. Secondary taskbars (other monitors) stay with Windows whether the
+        // dock is up or not: the dock replaces only the primary taskbar, and a
+        // second screen would otherwise have neither. One that an older build
+        // or a crash left hidden or parked off-screen is brought back. They
+        // share the primary's auto-hide setting, so while the dock is up they
+        // slide in from their screen's edge like any auto-hidden taskbar.
+        let on_screen = |hwnd| {
+            let mut rect = windows::Win32::Foundation::RECT::default();
+            GetWindowRect(hwnd, &mut rect).is_ok() && rect.left > -9000 && rect.top > -9000
+        };
         let mut secondary_positioned = true;
         for &secondary_tray_hwnd in &secondary_trays {
             use windows::Win32::UI::WindowsAndMessaging::{
                 SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
             };
-            if visible {
-                let saved = ORIGINAL_SEC_TRAY_RECTS.lock().ok().and_then(|guard| {
-                    guard
-                        .as_ref()
-                        .and_then(|rects| rects.get(&(secondary_tray_hwnd.0 as isize)).copied())
-                });
-                if let Some(rect) = saved {
-                    secondary_positioned &= SetWindowPos(
-                        secondary_tray_hwnd,
-                        None,
-                        rect.left,
-                        rect.top,
-                        0,
-                        0,
-                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                    )
-                    .is_ok();
-                }
-                let _ = ShowWindow(secondary_tray_hwnd, SW_SHOW);
-            } else {
-                let _ = ShowWindow(secondary_tray_hwnd, SW_HIDE);
-                let _ = SetWindowPos(
+            let saved = ORIGINAL_SEC_TRAY_RECTS.lock().ok().and_then(|guard| {
+                guard
+                    .as_ref()
+                    .and_then(|rects| rects.get(&(secondary_tray_hwnd.0 as isize)).copied())
+            });
+            if let Some(rect) = saved.filter(|_| !on_screen(secondary_tray_hwnd)) {
+                secondary_positioned &= SetWindowPos(
                     secondary_tray_hwnd,
                     None,
-                    -10000,
-                    -10000,
+                    rect.left,
+                    rect.top,
                     0,
                     0,
                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                );
+                )
+                .is_ok();
+            }
+            if !IsWindowVisible(secondary_tray_hwnd).as_bool() {
+                let _ = ShowWindow(secondary_tray_hwnd, SW_SHOW);
             }
         }
-        let on_screen = |hwnd| {
-            let mut rect = windows::Win32::Foundation::RECT::default();
-            GetWindowRect(hwnd, &mut rect).is_ok() && rect.left > -9000 && rect.top > -9000
-        };
+        // Taskbars back on screen no longer need their saved placement.
+        if let Ok(mut guard) = ORIGINAL_SEC_TRAY_RECTS.lock() {
+            if let Some(rects) = guard.as_mut() {
+                for &hwnd in &secondary_trays {
+                    if on_screen(hwnd) {
+                        rects.remove(&(hwnd.0 as isize));
+                    }
+                }
+            }
+        }
         let primary_matches = primary_positioned
             && IsWindowVisible(tray_hwnd).as_bool() == visible
             && (!visible || on_screen(tray_hwnd));
-        let secondary_matches = secondary_positioned
-            && secondary_trays.iter().all(|&hwnd| {
-                IsWindowVisible(hwnd).as_bool() == visible && (!visible || on_screen(hwnd))
-            });
+        // Only a restore waits on the secondary taskbars; hiding the primary
+        // never fails because of another monitor's taskbar.
+        let secondary_matches = !visible
+            || (secondary_positioned
+                && secondary_trays
+                    .iter()
+                    .all(|&hwnd| IsWindowVisible(hwnd).as_bool() && on_screen(hwnd)));
         if visible && primary_matches && secondary_matches {
             if let Some(p) = TASKBAR_MARKER.get() {
                 if p.exists() && std::fs::remove_file(p).is_err() {
                     return false;
-                }
-            }
-            // Restored taskbars no longer need their saved placement.
-            if let Ok(mut guard) = ORIGINAL_SEC_TRAY_RECTS.lock() {
-                if let Some(rects) = guard.as_mut() {
-                    for hwnd in &secondary_trays {
-                        rects.remove(&(hwnd.0 as isize));
-                    }
                 }
             }
         }
@@ -1512,10 +1509,18 @@ pub fn capture_hwnd_to_base64(hwnd: HWND, max_width: u32, max_height: u32) -> Op
 #[cfg(test)]
 mod tests {
     use super::{
-        click_through_style, expand_env_vars, is_placed_rect, marker_contents, moved_squirrel_exe,
-        newest_squirrel_folder, parse_marker_pid, parse_marker_rect, parse_marker_secondaries,
-        parse_marker_state, relaunch_executable,
+        click_through_style, expand_env_vars, is_dock_replaced_taskbar, is_placed_rect,
+        marker_contents, moved_squirrel_exe, newest_squirrel_folder, parse_marker_pid,
+        parse_marker_rect, parse_marker_secondaries, parse_marker_state, relaunch_executable,
     };
+
+    #[test]
+    fn dock_replaces_only_the_primary_taskbar() {
+        // The dock lives on the primary monitor; other monitors keep theirs.
+        assert!(is_dock_replaced_taskbar("Shell_TrayWnd"));
+        assert!(!is_dock_replaced_taskbar("Shell_SecondaryTrayWnd"));
+        assert!(!is_dock_replaced_taskbar(""));
+    }
 
     #[test]
     fn picks_the_newest_squirrel_version_by_number() {

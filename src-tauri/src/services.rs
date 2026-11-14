@@ -648,8 +648,9 @@ unsafe extern "system" fn taskbar_event_proc(
         let len = windows::Win32::UI::WindowsAndMessaging::GetClassNameA(hwnd, &mut class_name);
         let class_str = std::str::from_utf8(&class_name[..len as usize]).unwrap_or("");
 
-        if class_str == "Shell_TrayWnd" || class_str == "Shell_SecondaryTrayWnd" {
-            // Taskbar is trying to show or move: slap it back down.
+        if is_dock_replaced_taskbar(class_str) {
+            // The primary taskbar is trying to show or move: slap it back
+            // down. Other monitors' taskbars are left to Windows.
             set_taskbar_visibility(false, false);
         }
     }
@@ -1710,9 +1711,10 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                     sync_native_osd(&handle_visibility);
                 }
 
-                // Enforce native taskbar hiding (periodic check)
+                // Enforce native taskbar hiding (periodic check). Only the
+                // primary taskbar: the other monitors keep theirs.
                 if NATIVE_TASKBAR_HIDDEN.load(Ordering::Relaxed)
-                    && (refresh_taskbar_owner() || any_native_taskbar_visible())
+                    && (refresh_taskbar_owner() || primary_taskbar_visible())
                 {
                     set_taskbar_visibility(false, false);
                 }
