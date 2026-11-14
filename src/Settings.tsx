@@ -278,12 +278,6 @@ function SettingsApp() {
 							tempUnitFahrenheit={settings.tempUnitFahrenheit}
 							toggleTempUnit={settings.toggleTempUnit}
 							cityName={settings.cityName}
-							setCityName={settings.setCityName}
-							citySearchResults={settings.citySearchResults}
-							showCityDropdown={settings.showCityDropdown}
-							setShowCityDropdown={settings.setShowCityDropdown}
-							selectCity={settings.selectCity}
-							handleCityClear={settings.handleCityClear}
 							statusWidgets={settings.statusWidgets}
 							handleWidgetsChange={settings.handleWidgetsChange}
 						/>

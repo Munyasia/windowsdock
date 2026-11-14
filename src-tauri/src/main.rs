@@ -7,6 +7,7 @@ mod commands;
 mod diagnostics;
 mod dock_extras;
 mod jack;
+mod location;
 mod profile_icon;
 mod services;
 mod settings_window;
@@ -207,6 +208,7 @@ fn main() {
             get_battery_saver_state,
             open_battery_saver_settings,
             battery::get_battery_details,
+            location::get_device_location,
             get_system_accent_color,
             get_cpu_usage,
             get_ram_usage,

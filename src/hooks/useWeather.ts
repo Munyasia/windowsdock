@@ -47,8 +47,6 @@ const WMO_CODES: Record<number, string> = {
 	99: "Stormy"
 };
 
-const DELHI_LAT = 28.6139;
-const DELHI_LON = 77.209;
 const REFRESH_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 
 interface WeatherState {
@@ -122,23 +120,50 @@ async function fetchWeatherForCoords(
 	};
 }
 
-async function resolveLocation(): Promise<ResolvedLocation> {
-	// 1. Check saved coordinates from the backend settings file.
-	try {
-		const settings = (await invoke("load_settings").catch(() => ({}))) as Record<string, any>;
-		const savedLat = settings["bloom-weather-lat"];
-		const savedLon = settings["bloom-weather-lon"];
-		const savedCity = settings["bloom-weather-city"] || localStorage.getItem("bloom-weather-city");
+interface DeviceLocation {
+	lat: number;
+	lon: number;
+	accuracy_m: number;
+}
 
-		if (savedLat && savedLon) {
-			return {
-				lat: parseFloat(savedLat),
-				lon: parseFloat(savedLon),
-				city: savedCity || undefined
-			};
-		}
+// The last reverse-geocoded point. Weather refreshes every 30 minutes, and the
+// city only needs looking up again once the device has moved.
+let lastGeocoded: { lat: number; lon: number; city: string } | null = null;
+const SAME_PLACE_DEGREES = 0.02; // about 2 km
+
+async function cityForCoords(lat: number, lon: number): Promise<string | undefined> {
+	if (
+		lastGeocoded &&
+		Math.abs(lastGeocoded.lat - lat) < SAME_PLACE_DEGREES &&
+		Math.abs(lastGeocoded.lon - lon) < SAME_PLACE_DEGREES
+	) {
+		return lastGeocoded.city;
+	}
+	try {
+		const res = await fetch(
+			`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`
+		);
+		if (!res.ok) return undefined;
+		const data = await res.json();
+		const city: string = data.city || data.locality || data.principalSubdivision || "";
+		if (!city) return undefined;
+		lastGeocoded = { lat, lon, city };
+		return city;
 	} catch {
-		// continue to IP geolocation
+		return undefined;
+	}
+}
+
+// Weather always follows the device. The Windows location service comes
+// first since Wi-Fi positioning is far closer than an IP lookup, which can
+// land in another city when the ISP routes traffic elsewhere.
+async function resolveLocation(): Promise<ResolvedLocation> {
+	// 1. Windows location service.
+	try {
+		const device = await invoke<DeviceLocation>("get_device_location");
+		return { lat: device.lat, lon: device.lon, city: await cityForCoords(device.lat, device.lon) };
+	} catch (e) {
+		console.info("Windows location unavailable, using IP location:", e);
 	}
 
 	// 2. Try IP-based geolocation
@@ -167,11 +192,12 @@ async function resolveLocation(): Promise<ResolvedLocation> {
 			}
 		}
 	} catch {
-		// fall through to default
+		// fall through
 	}
 
-	// 4. Default to Delhi
-	return { lat: DELHI_LAT, lon: DELHI_LON, city: "Delhi" };
+	// No location at all: keep showing the last weather rather than another
+	// city's.
+	throw new Error("Could not determine the current location");
 }
 
 async function persistWeather(temp: number | null, condition: string): Promise<void> {
@@ -213,11 +239,11 @@ export function useWeather(enabled: boolean) {
 
 	// Core fetch + refresh logic
 	const doFetch = useCallback(
-		async (showStaleOnError = true, coords?: { lat: number; lon: number }) => {
+		async (showStaleOnError = true) => {
 			if (!enabledRef.current) return;
 
 			try {
-				const location = coords ? { ...coords, city: undefined } : await resolveLocation();
+				const location = await resolveLocation();
 				const result = await fetchWeatherForCoords(location.lat, location.lon, tempUnitRef.current);
 
 				setTemperature(result.temperature);
@@ -225,13 +251,14 @@ export function useWeather(enabled: boolean) {
 				setWeatherIcon(() => result.weatherIcon);
 				persistWeather(result.temperature, result.weatherCondition);
 
-				// Update city name if resolved from IP geolocation
-				if (location.city) {
-					setCityName(location.city);
-					localStorage.setItem("bloom-weather-city", location.city);
-					invoke("save_setting", { key: "bloom-weather-city", value: location.city }).catch(
-						() => {}
-					);
+				// Show where the weather is for. An unnamed place clears the label,
+				// so a city typed in by an older version can't linger beside
+				// weather from somewhere else.
+				const city = location.city ?? "";
+				setCityName(city);
+				if (city !== (localStorage.getItem("bloom-weather-city") ?? "")) {
+					localStorage.setItem("bloom-weather-city", city);
+					invoke("save_setting", { key: "bloom-weather-city", value: city }).catch(() => {});
 				}
 			} catch (e) {
 				console.warn("Weather fetch failed:", e);
@@ -298,23 +325,6 @@ export function useWeather(enabled: boolean) {
 			unlistenExternal.then((fn) => fn());
 		};
 	}, []);
-
-	// Listen for instant refresh from Settings (direct Tauri event with coords)
-	useEffect(() => {
-		if (!enabled) return;
-
-		const unlisten = listen<{ lat: number; lon: number } | true>("weather-refresh", (event) => {
-			const payload = event.payload;
-			if (payload && typeof payload === "object" && "lat" in payload && "lon" in payload) {
-				doFetch(false, { lat: (payload as any).lat, lon: (payload as any).lon });
-			} else {
-				doFetch(false);
-			}
-		});
-		return () => {
-			unlisten.then((fn) => fn());
-		};
-	}, [enabled, doFetch]);
 
 	// Listen for city name changes from Settings
 	useEffect(() => {

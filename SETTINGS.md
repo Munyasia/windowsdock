@@ -52,9 +52,7 @@ Edit `settings.json` with any text editor while Bloom is running. Changes are ap
 | Key                              | Type                         | Default     | Description                                                                        |
 | -------------------------------- | ---------------------------- | ----------- | ---------------------------------------------------------------------------------- |
 | `bloom-weather-enabled`          | `"true"` / `"false"`         | `"true"`    | Show weather widget in the notch status bar.                                       |
-| `bloom-weather-city`             | string                       | `""`        | Manually set city name for weather. Empty string = auto-detect via IP geolocation. |
-| `bloom-weather-lat`              | number string                | (auto)      | Latitude coordinate for weather. Set automatically when a city is selected.        |
-| `bloom-weather-lon`              | number string                | (auto)      | Longitude coordinate for weather. Set automatically when a city is selected.       |
+| `bloom-weather-city`             | string                       | `""`        | City the weather is for, detected from the device's location. Set automatically.   |
 | `bloom-weather-cached-temp`      | number string                | (none)      | Cached temperature value shown before next API fetch.                              |
 | `bloom-weather-cached-condition` | string                       | (none)      | Cached weather condition text (e.g. "Partly Cloudy").                              |
 | `bloom-temp-unit`                | `"celsius"` / `"fahrenheit"` | `"celsius"` | Temperature display unit.                                                          |

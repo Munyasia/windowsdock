@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, emit } from "@tauri-apps/api/event";
+import { listen } from "@tauri-apps/api/event";
 import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { getVersion } from "@tauri-apps/api/app";
 import type { UpdateCheckResult } from "../updater";
@@ -96,10 +96,6 @@ export function useSettings() {
 	);
 	const [tempUnitFahrenheit, setTempUnitFahrenheit] = useState(false);
 	const [cityName, setCityName] = useState("");
-	const [citySearchResults, setCitySearchResults] = useState<
-		Array<{ name: string; country: string; latitude: number; longitude: number }>
-	>([]);
-	const [showCityDropdown, setShowCityDropdown] = useState(false);
 	const [statusWidgets, setStatusWidgets] = useState<WidgetConfig>({
 		left: ["weather"],
 		right: ["battery"]
@@ -331,36 +327,6 @@ export function useSettings() {
 		return operation;
 	};
 
-	// Coordinates only need the backend settings file. Keep them out of the
-	// browser's localStorage mirror while preserving the same queued/error path.
-	const saveLocation = (key: "bloom-weather-lat" | "bloom-weather-lon", value: string | null): Promise<boolean> => {
-		const operation = saveQueue.current.then(async () => {
-			if (saveFailed.current) return false;
-			try {
-				await invoke<void>("save_setting", { key, value });
-			} catch (error) {
-				console.error(`Failed to save ${key}:`, error);
-				saveFailed.current = true;
-				sessionStorage.setItem("bloom-settings-save-error", "true");
-				sessionStorage.setItem("bloom-settings-save-error-detail", String(error));
-				setSaveErrorDetail(String(error));
-				setSaveError(true);
-				window.setTimeout(() => window.location.reload(), 0);
-				return false;
-			}
-			try {
-				localStorage.removeItem(key);
-				sessionStorage.removeItem("bloom-settings-save-error");
-				sessionStorage.removeItem("bloom-settings-save-error-detail");
-			} catch (error) {
-				console.warn("Settings mirror cleanup failed:", error);
-			}
-			setSaveError(false);
-			return true;
-		});
-		saveQueue.current = operation.then(() => {});
-		return operation;
-	};
 
 	const dismissSaveError = () => {
 		sessionStorage.removeItem("bloom-settings-save-error");
@@ -461,41 +427,6 @@ export function useSettings() {
 			unlisten.then((fn) => fn());
 		};
 	}, []);
-
-	// ── City search debounce ──
-	useEffect(() => {
-		if (cityName.trim().length < 2) {
-			setCitySearchResults([]);
-			setShowCityDropdown(false);
-			return;
-		}
-
-		const timeout = setTimeout(async () => {
-			try {
-				const res = await fetch(
-					`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(cityName)}&count=5&language=en&format=json`
-				);
-				const data = await res.json();
-				if (data.results && data.results.length > 0) {
-					setCitySearchResults(
-						data.results.map((r: any) => ({
-							name: r.name,
-							country: r.country || "",
-							latitude: r.latitude,
-							longitude: r.longitude
-						}))
-					);
-					setShowCityDropdown(true);
-				} else {
-					setCitySearchResults([]);
-				}
-			} catch {
-				setCitySearchResults([]);
-			}
-		}, 300);
-
-		return () => clearTimeout(timeout);
-	}, [cityName]);
 
 	// ── Update checker ──
 	const checkForUpdates = async (manual = true) => {
@@ -925,34 +856,6 @@ export function useSettings() {
 		saveSetting("bloom-theme-brightness", String(value));
 	};
 
-	// ── City search ──
-	const selectCity = async (city: {
-		name: string;
-		country: string;
-		latitude: number;
-		longitude: number;
-	}) => {
-		setCityName(city.name);
-		setShowCityDropdown(false);
-		setCitySearchResults([]);
-		const saved =
-			(await saveLocation("bloom-weather-lat", city.latitude.toString())) &&
-			(await saveLocation("bloom-weather-lon", city.longitude.toString())) &&
-			(await saveSetting("bloom-weather-city", city.name));
-		if (saved) emit("weather-refresh", { lat: city.latitude, lon: city.longitude });
-	};
-
-	const handleCityClear = async () => {
-		setCityName("");
-		setShowCityDropdown(false);
-		setCitySearchResults([]);
-		const saved =
-			(await saveLocation("bloom-weather-lat", null)) &&
-			(await saveLocation("bloom-weather-lon", null)) &&
-			(await saveSetting("bloom-weather-city", null));
-		if (saved) emit("weather-refresh", true);
-	};
-
 	// ── Reset to defaults ──
 	const resetToDefaults = async () => {
 		try {
@@ -1102,12 +1005,6 @@ export function useSettings() {
 		tempUnitFahrenheit,
 		toggleTempUnit,
 		cityName,
-		setCityName,
-		citySearchResults,
-		showCityDropdown,
-		setShowCityDropdown,
-		selectCity,
-		handleCityClear,
 
 		// Widgets
 		statusWidgets,

@@ -11,8 +11,7 @@ import {
 	Timer,
 	Archive,
 	Headphones,
-	SlidersHorizontal,
-	X
+	SlidersHorizontal
 } from "lucide-react";
 import { SettingRow } from "./SettingRow";
 import { StatusWidgetConfig } from "../components/StatusWidgetConfig";
@@ -65,17 +64,6 @@ interface NotchTabProps {
 	tempUnitFahrenheit: boolean;
 	toggleTempUnit: () => void;
 	cityName: string;
-	setCityName: (name: string) => void;
-	citySearchResults: Array<{ name: string; country: string; latitude: number; longitude: number }>;
-	showCityDropdown: boolean;
-	setShowCityDropdown: (show: boolean) => void;
-	selectCity: (city: {
-		name: string;
-		country: string;
-		latitude: number;
-		longitude: number;
-	}) => void;
-	handleCityClear: () => void;
 	statusWidgets: WidgetConfig;
 	handleWidgetsChange: (config: WidgetConfig) => void;
 }
@@ -118,12 +106,6 @@ export function NotchTab({
 	tempUnitFahrenheit,
 	toggleTempUnit,
 	cityName,
-	setCityName,
-	citySearchResults,
-	showCityDropdown,
-	setShowCityDropdown,
-	selectCity,
-	handleCityClear,
 	statusWidgets,
 	handleWidgetsChange
 }: NotchTabProps) {
@@ -380,7 +362,8 @@ export function NotchTab({
 				<SettingRow
 					icon={CloudSun}
 					label="Weather Status"
-					desc={cityName || "Auto-detect location"}
+					desc={cityName ? `Your location: ${cityName}` : "Uses your current location"}
+					divider={false}
 				>
 					<div className="weather-controls">
 						<div className="unit-toggle-minimal" onClick={toggleTempUnit}>
@@ -393,59 +376,6 @@ export function NotchTab({
 						</label>
 					</div>
 				</SettingRow>
-
-				{weatherEnabled && (
-					<div className="manual-city-input">
-						<div className="city-input-row">
-							<input
-								type="text"
-								placeholder="Search city..."
-								value={cityName}
-								onChange={(e) => setCityName(e.target.value)}
-								onFocus={() => citySearchResults.length > 0 && setShowCityDropdown(true)}
-								onKeyDown={(e) => {
-									if (e.key === "Enter" && citySearchResults.length > 0) {
-										e.preventDefault();
-										selectCity(citySearchResults[0]);
-									}
-									if (e.key === "Escape") {
-										setShowCityDropdown(false);
-									}
-								}}
-								onBlur={() => setTimeout(() => setShowCityDropdown(false), 150)}
-							/>
-							{cityName && (
-								<button
-									className="city-clear-btn"
-									onMouseDown={(e) => {
-										e.preventDefault();
-										handleCityClear();
-									}}
-									title="Clear city"
-								>
-									<X size={10} strokeWidth={2.5} />
-								</button>
-							)}
-						</div>
-						{showCityDropdown && citySearchResults.length > 0 && (
-							<div className="city-dropdown">
-								{citySearchResults.map((city) => (
-									<button
-										key={`${city.name}-${city.latitude}`}
-										className="city-dropdown-item"
-										onMouseDown={(e) => {
-											e.preventDefault();
-											selectCity(city);
-										}}
-									>
-										<span className="city-dropdown-name">{city.name}</span>
-										<span className="city-dropdown-country">{city.country}</span>
-									</button>
-								))}
-							</div>
-						)}
-					</div>
-				)}
 			</div>
 
 			<div className="setting-group-label">Widgets</div>
