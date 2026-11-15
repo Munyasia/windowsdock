@@ -708,280 +708,460 @@ unsafe extern "system" fn taskbar_event_proc(
     }
 }
 
+/// Bars in the notch's music visualizer.
+const VIS_BANDS: usize = 5;
+/// Samples per FFT window, about 10 ms of audio at 48 kHz.
+const VIS_FFT_SIZE: usize = 512;
+/// Lowest bar height sent to the notch, so the bars never vanish.
+const VIS_FLOOR: f32 = 0.18;
+/// Minimum gap between visualizer events. The notch springs between values,
+/// so ~33 updates a second look as smooth as the ~94 the FFT produces.
+const VIS_EMIT_INTERVAL: Duration = Duration::from_millis(30);
+
+/// How a capture stream lays out its samples.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum VisSampleFormat {
+    F32,
+    I16,
+    I32,
+}
+
+impl VisSampleFormat {
+    fn bytes(self) -> usize {
+        match self {
+            VisSampleFormat::I16 => 2,
+            VisSampleFormat::F32 | VisSampleFormat::I32 => 4,
+        }
+    }
+}
+
+/// Sample layout of a WASAPI mix format, or None for layouts the visualizer
+/// can't read (packed 24-bit, compressed). `sub_format` is the first field of
+/// WAVEFORMATEXTENSIBLE's SubFormat GUID, which carries the real format tag
+/// when `tag` is WAVE_FORMAT_EXTENSIBLE.
+fn vis_sample_format(tag: u16, bits: u16, sub_format: Option<u32>) -> Option<VisSampleFormat> {
+    const PCM: u32 = 1;
+    const IEEE_FLOAT: u32 = 3;
+    const EXTENSIBLE: u16 = 0xFFFE;
+    let kind = if tag == EXTENSIBLE {
+        sub_format?
+    } else {
+        tag as u32
+    };
+    match (kind, bits) {
+        (IEEE_FLOAT, 32) => Some(VisSampleFormat::F32),
+        (PCM, 16) => Some(VisSampleFormat::I16),
+        (PCM, 32) => Some(VisSampleFormat::I32),
+        _ => None,
+    }
+}
+
+/// Averages one interleaved frame's channels into a mono sample in -1..1.
+fn vis_mono_sample(frame: &[u8], channels: usize, format: VisSampleFormat) -> f32 {
+    let mut sum = 0.0f32;
+    for channel in frame.chunks_exact(format.bytes()).take(channels) {
+        let value = match format {
+            VisSampleFormat::F32 => {
+                f32::from_le_bytes([channel[0], channel[1], channel[2], channel[3]])
+            }
+            VisSampleFormat::I16 => i16::from_le_bytes([channel[0], channel[1]]) as f32 / 32768.0,
+            VisSampleFormat::I32 => {
+                i32::from_le_bytes([channel[0], channel[1], channel[2], channel[3]]) as f32
+                    / 2147483648.0
+            }
+        };
+        if value.is_finite() {
+            sum += value;
+        }
+    }
+    sum / channels.max(1) as f32
+}
+
+/// Turns a mono sample stream into the notch's bar heights: a Hann-windowed
+/// FFT per VIS_FFT_SIZE samples, split into weighted bands, normalised
+/// against each band's slowly decaying peak and smoothed between windows.
+struct VisBandAnalyzer {
+    fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
+    window: Vec<f32>,
+    samples: Vec<f32>,
+    spectrum: Vec<rustfft::num_complex::Complex<f32>>,
+    scratch: Vec<rustfft::num_complex::Complex<f32>>,
+    peaks: [f32; VIS_BANDS],
+    previous: [f32; VIS_BANDS],
+}
+
+impl VisBandAnalyzer {
+    fn new() -> Self {
+        let fft = rustfft::FftPlanner::<f32>::new().plan_fft_forward(VIS_FFT_SIZE);
+        let scratch_len = fft.get_inplace_scratch_len();
+        let window = (0..VIS_FFT_SIZE)
+            .map(|i| {
+                0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / VIS_FFT_SIZE as f32).cos())
+            })
+            .collect();
+        let zero = rustfft::num_complex::Complex::new(0.0, 0.0);
+        Self {
+            fft,
+            window,
+            samples: Vec::with_capacity(VIS_FFT_SIZE),
+            spectrum: vec![zero; VIS_FFT_SIZE],
+            scratch: vec![zero; scratch_len],
+            peaks: [0.01; VIS_BANDS],
+            previous: [0.1; VIS_BANDS],
+        }
+    }
+
+    /// Adds one mono sample. Returns new bar heights each time a full FFT
+    /// window has been analysed.
+    fn push(&mut self, sample: f32) -> Option<[f32; VIS_BANDS]> {
+        self.samples.push(sample);
+        if self.samples.len() < VIS_FFT_SIZE {
+            return None;
+        }
+        for ((slot, &sample), &weight) in self
+            .spectrum
+            .iter_mut()
+            .zip(&self.samples)
+            .zip(&self.window)
+        {
+            *slot = rustfft::num_complex::Complex::new(sample * weight, 0.0);
+        }
+        self.samples.clear();
+        self.fft
+            .process_with_scratch(&mut self.spectrum, &mut self.scratch);
+
+        const BAND_BINS: [(usize, usize); VIS_BANDS] =
+            [(1, 2), (2, 6), (6, 18), (18, 60), (60, 200)];
+        const WEIGHTING: [f32; VIS_BANDS] = [1.2, 1.2, 1.5, 2.8, 5.0];
+        let mut bars = [VIS_FLOOR; VIS_BANDS];
+        for (band, &(start, end)) in BAND_BINS.iter().enumerate() {
+            let bins = &self.spectrum[start..end.min(VIS_FFT_SIZE / 2)];
+            let average =
+                bins.iter().map(|bin| bin.norm()).sum::<f32>() / bins.len().max(1) as f32;
+            let level = average * WEIGHTING[band];
+            if level > self.peaks[band] {
+                self.peaks[band] = level;
+            } else {
+                self.peaks[band] *= 0.99;
+            }
+            let target = (level / self.peaks[band].max(0.12)).min(1.0).powf(0.75);
+            let smoothing = if target > self.previous[band] { 0.10 } else { 0.20 };
+            let value = (self.previous[band] * smoothing + target * (1.0 - smoothing))
+                .clamp(VIS_FLOOR, 1.0);
+            self.previous[band] = value;
+            bars[band] = value;
+        }
+        Some(bars)
+    }
+}
+
+/// Completion callback for ActivateAudioInterfaceAsync. Windows calls it on
+/// one of its own threads while the capture thread waits on the channel.
+#[windows_core::implement(windows::Win32::Media::Audio::IActivateAudioInterfaceCompletionHandler)]
+struct VisActivationDone(std::sync::mpsc::Sender<()>);
+
+impl windows::Win32::Media::Audio::IActivateAudioInterfaceCompletionHandler_Impl
+    for VisActivationDone_Impl
+{
+    fn ActivateCompleted(
+        &self,
+        _operation: windows_core::Ref<
+            windows::Win32::Media::Audio::IActivateAudioInterfaceAsyncOperation,
+        >,
+    ) -> windows_core::Result<()> {
+        let _ = self.0.send(());
+        Ok(())
+    }
+}
+
+/// A PROPVARIANT holding a VT_BLOB, laid out by hand because windows-rs has
+/// no constructor for one. The assert keeps it the size of the real type.
+#[repr(C, align(8))]
+struct VisBlobVariant {
+    vt: u16,
+    reserved: [u16; 3],
+    size: u32,
+    data: *mut u8,
+}
+const _: () = assert!(
+    std::mem::size_of::<VisBlobVariant>()
+        == std::mem::size_of::<windows::Win32::System::Com::StructuredStorage::PROPVARIANT>()
+);
+
+/// Activates a process loopback client (Windows 10 2004 and later) that hears
+/// every app. Windows only offers "this process tree" or "everything but this
+/// process tree", and apps opened from the dock are Bloom's children, so
+/// excluding Bloom would silence them. Instead it excludes u32::MAX, which can
+/// never be a process ID because Windows only hands out multiples of 4.
+unsafe fn open_process_loopback_client(
+) -> Result<windows::Win32::Media::Audio::IAudioClient, String> {
+    use windows::Win32::Media::Audio::{
+        ActivateAudioInterfaceAsync, IActivateAudioInterfaceCompletionHandler, IAudioClient,
+        AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
+        AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
+        PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+    };
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows_core::{IUnknown, Interface, HRESULT};
+
+    let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
+        ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+            ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                TargetProcessId: u32::MAX,
+                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+            },
+        },
+    };
+    let variant = VisBlobVariant {
+        vt: 65, // VT_BLOB
+        reserved: [0; 3],
+        size: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+        data: &mut params as *mut _ as *mut u8,
+    };
+    let (done, finished) = std::sync::mpsc::channel();
+    let handler: IActivateAudioInterfaceCompletionHandler = VisActivationDone(done).into();
+    let operation = ActivateAudioInterfaceAsync(
+        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+        &IAudioClient::IID,
+        Some(&variant as *const VisBlobVariant as *const PROPVARIANT),
+        &handler,
+    )
+    .map_err(|e| format!("ActivateAudioInterfaceAsync failed: {e:?}"))?;
+    finished
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "process loopback activation timed out".to_string())?;
+    let mut result = HRESULT(0);
+    let mut activated: Option<IUnknown> = None;
+    operation
+        .GetActivateResult(&mut result, &mut activated)
+        .map_err(|e| format!("GetActivateResult failed: {e:?}"))?;
+    result
+        .ok()
+        .map_err(|e| format!("process loopback unavailable: {e:?}"))?;
+    activated
+        .ok_or_else(|| "process loopback returned no client".to_string())?
+        .cast::<IAudioClient>()
+        .map_err(|e| e.to_string())
+}
+
+/// A started loopback stream. Dropping it stops the stream.
+struct VisCapture {
+    client: windows::Win32::Media::Audio::IAudioClient,
+    capture: windows::Win32::Media::Audio::IAudioCaptureClient,
+    event: windows::Win32::Foundation::HANDLE,
+    channels: usize,
+    format: VisSampleFormat,
+}
+
+impl Drop for VisCapture {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.client.Stop();
+            let _ = CloseHandle(self.event);
+        }
+    }
+}
+
+/// Opens a loopback stream on everything the PC plays. Process loopback goes
+/// first because the classic endpoint loopback can deliver nothing at all:
+/// on a Conexant ISST laptop on Insider build 26320 it started cleanly, but
+/// its clock never moved and no packets arrived while music played. Endpoint
+/// loopback stays as the fallback for Windows builds without process loopback.
+unsafe fn open_visualizer_capture(
+    device: &windows::Win32::Media::Audio::IMMDevice,
+) -> Result<VisCapture, String> {
+    use windows::Win32::Media::Audio::{
+        IAudioCaptureClient, IAudioClient, AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX,
+    };
+    use windows::Win32::System::Com::{CoTaskMemFree, CLSCTX_ALL};
+    use windows::Win32::System::Threading::CreateEventW;
+
+    let flags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+    let (client, channels, format) = match open_process_loopback_client() {
+        Ok(client) => {
+            // Process loopback has no mix format of its own and converts to
+            // whatever the client asks for.
+            let wanted = WAVEFORMATEX {
+                wFormatTag: 3, // WAVE_FORMAT_IEEE_FLOAT
+                nChannels: 2,
+                nSamplesPerSec: 48000,
+                nAvgBytesPerSec: 48000 * 8,
+                nBlockAlign: 8,
+                wBitsPerSample: 32,
+                cbSize: 0,
+            };
+            client
+                .Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2_000_000, 0, &wanted, None)
+                .map_err(|e| format!("process loopback Initialize failed: {e:?}"))?;
+            (client, 2, VisSampleFormat::F32)
+        }
+        Err(_) => {
+            let client: IAudioClient = device
+                .Activate(CLSCTX_ALL, None)
+                .map_err(|e| format!("Activate failed: {e:?}"))?;
+            let mix = client
+                .GetMixFormat()
+                .map_err(|e| format!("GetMixFormat failed: {e:?}"))?;
+            let base = std::ptr::read_unaligned(mix);
+            let (tag, bits, channels) = (base.wFormatTag, base.wBitsPerSample, base.nChannels);
+            let sub_format = (tag == 0xFFFE && base.cbSize >= 22).then(|| {
+                // SubFormat sits 24 bytes into WAVEFORMATEXTENSIBLE.
+                std::ptr::read_unaligned((mix as *const u8).add(24) as *const u32)
+            });
+            let initialized = match vis_sample_format(tag, bits, sub_format) {
+                Some(format) if channels > 0 => client
+                    .Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 10_000_000, 0, mix, None)
+                    .map(|()| format)
+                    .map_err(|e| format!("Initialize failed: {e:?}")),
+                _ => Err(format!(
+                    "unsupported mix format: tag={tag:#x} bits={bits} channels={channels}"
+                )),
+            };
+            CoTaskMemFree(Some(mix as *const _));
+            (client, channels as usize, initialized?)
+        }
+    };
+
+    let capture: IAudioCaptureClient = client
+        .GetService()
+        .map_err(|e| format!("GetService failed: {e:?}"))?;
+    let event = CreateEventW(None, false, false, None).map_err(|e| e.to_string())?;
+    let stream = VisCapture {
+        client,
+        capture,
+        event,
+        channels,
+        format,
+    };
+    stream
+        .client
+        .SetEventHandle(stream.event)
+        .map_err(|e| format!("SetEventHandle failed: {e:?}"))?;
+    stream
+        .client
+        .Start()
+        .map_err(|e| format!("Start failed: {e:?}"))?;
+    Ok(stream)
+}
+
+/// ID string of an audio endpoint, empty if Windows won't give one.
+unsafe fn vis_endpoint_id(device: &windows::Win32::Media::Audio::IMMDevice) -> String {
+    match device.GetId() {
+        Ok(id) => {
+            let text = id.to_string().unwrap_or_default();
+            windows::Win32::System::Com::CoTaskMemFree(Some(id.0 as *const _));
+            text
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// Captures and analyses audio until playback stops (Ok) or the stream or
+/// default device goes away (Err).
+unsafe fn run_visualizer_capture(
+    app_handle: &AppHandle,
+    analyzer: &mut VisBandAnalyzer,
+) -> Result<(), String> {
+    use windows::Win32::Media::Audio::{
+        eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
+    };
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
+
+    let enumerator: IMMDeviceEnumerator =
+        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+            .map_err(|e| format!("CoCreateInstance failed: {e:?}"))?;
+    let device = enumerator
+        .GetDefaultAudioEndpoint(eRender, eConsole)
+        .map_err(|e| format!("GetDefaultAudioEndpoint failed: {e:?}"))?;
+    let device_id = vis_endpoint_id(&device);
+    let stream = open_visualizer_capture(&device)?;
+    let frame_bytes = stream.channels * stream.format.bytes();
+
+    let mut last_device_check = Instant::now();
+    let mut last_emit: Option<Instant> = None;
+    while ANY_MEDIA_PLAYING.load(Ordering::Relaxed) {
+        // Woken by the stream's event. The timeout keeps a 32 ms poll going
+        // on builds where loopback streams never signal it.
+        WaitForSingleObject(stream.event, 32);
+
+        if last_device_check.elapsed() >= Duration::from_secs(2) {
+            last_device_check = Instant::now();
+            if let Ok(current) = enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
+                if vis_endpoint_id(&current) != device_id {
+                    return Err("default device changed".into());
+                }
+            }
+        }
+
+        let mut latest = None;
+        loop {
+            let packet = stream
+                .capture
+                .GetNextPacketSize()
+                .map_err(|_| "device invalidated".to_string())?;
+            if packet == 0 {
+                break;
+            }
+            let mut data: *mut u8 = std::ptr::null_mut();
+            let mut frames = 0u32;
+            let mut flags = 0u32;
+            stream
+                .capture
+                .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
+                .map_err(|_| "device invalidated".to_string())?;
+            if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 || data.is_null() {
+                for _ in 0..frames {
+                    latest = analyzer.push(0.0).or(latest);
+                }
+            } else {
+                let bytes = std::slice::from_raw_parts(data, frames as usize * frame_bytes);
+                for frame in bytes.chunks_exact(frame_bytes) {
+                    let sample = vis_mono_sample(frame, stream.channels, stream.format);
+                    latest = analyzer.push(sample).or(latest);
+                }
+            }
+            let _ = stream.capture.ReleaseBuffer(frames);
+        }
+
+        if let Some(bars) = latest {
+            if last_emit.is_none_or(|at| at.elapsed() >= VIS_EMIT_INTERVAL) {
+                last_emit = Some(Instant::now());
+                // Only the notch draws the bars, so skip the other webviews.
+                let _ = app_handle.emit_to(
+                    "main",
+                    "audio-visualization",
+                    AudioVisualizationData {
+                        frequencies: bars.to_vec(),
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Feeds the notch's music bars. The capture stream only exists while media
+/// plays, so an idle Bloom holds no audio stream open.
 pub fn setup_audio_visualization(app_handle: AppHandle) {
     std::thread::spawn(move || {
-        use windows::Win32::Media::Audio::{
-            eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
-            AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-        };
-        use windows::Win32::System::Com::{
-            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
-        };
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-
-            const NUM_BANDS: usize = 5;
-            let mut max_band_energies = [0.01f32; NUM_BANDS];
-            let mut prev_values = [0.1f32; NUM_BANDS];
-
-            loop {
-                let _: Result<(), String> = (|| {
-                    let enumerator: IMMDeviceEnumerator = CoCreateInstance(
-                        &windows::Win32::Media::Audio::MMDeviceEnumerator,
-                        None,
-                        CLSCTX_ALL,
-                    )
-                    .map_err(|e| format!("CoCreateInstance failed: {:?}", e))?;
-
-                    let device: IMMDevice =
-                        enumerator
-                            .GetDefaultAudioEndpoint(eRender, eConsole)
-                            .map_err(|e| format!("GetDefaultAudioEndpoint failed: {:?}", e))?;
-
-                    let current_id_str = if let Ok(id) = device.GetId() {
-                        let id_str = windows::core::PCWSTR::from_raw(id.0)
-                            .to_string()
-                            .unwrap_or_default();
-                        CoTaskMemFree(Some(id.0 as *const _));
-                        id_str
-                    } else {
-                        String::new()
-                    };
-
-                    let audio_client: IAudioClient = device
-                        .Activate(CLSCTX_ALL, None)
-                        .map_err(|e| format!("Activate failed: {:?}", e))?;
-
-                    let format_ptr = audio_client
-                        .GetMixFormat()
-                        .map_err(|e| format!("GetMixFormat failed: {:?}", e))?;
-
-                    let channels = (*format_ptr).nChannels as usize;
-                    let bits_per_sample = (*format_ptr).wBitsPerSample;
-                    let bytes_per_sample = (bits_per_sample / 8) as usize;
-
-                    if bytes_per_sample == 0 || channels == 0 || bytes_per_sample > 4 {
-                        CoTaskMemFree(Some(format_ptr as *const _));
-                        return Err(format!(
-                            "Invalid audio format: channels={}, bits={}",
-                            channels, bits_per_sample
-                        ));
-                    }
-
-                    let buffer_duration = 10_000_000i64;
-                    audio_client
-                        .Initialize(
-                            AUDCLNT_SHAREMODE_SHARED,
-                            AUDCLNT_STREAMFLAGS_LOOPBACK,
-                            buffer_duration,
-                            0,
-                            format_ptr,
-                            Some(std::ptr::null()),
-                        )
-                        .map_err(|e| format!("Initialize failed: {:?}", e))?;
-
-                    CoTaskMemFree(Some(format_ptr as *const _));
-
-                    let capture_client: IAudioCaptureClient = audio_client
-                        .GetService()
-                        .map_err(|e| format!("GetService failed: {:?}", e))?;
-
-                    audio_client
-                        .Start()
-                        .map_err(|e| format!("Start failed: {:?}", e))?;
-
-                    const FFT_SIZE: usize = 512;
-                    let mut fft_buffer = vec![0.0f32; FFT_SIZE];
-                    let mut fft_input: Vec<rustfft::num_complex::Complex<f32>> =
-                        vec![rustfft::num_complex::Complex::new(0.0, 0.0); FFT_SIZE];
-                    let mut buffer_pos = 0;
-
-                    let mut planner = rustfft::FftPlanner::<f32>::new();
-                    let fft = planner.plan_fft_forward(FFT_SIZE);
-
-                    let mut last_device_check = std::time::Instant::now();
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_millis(32));
-
-                        if last_device_check.elapsed().as_secs() >= 2 {
-                            last_device_check = std::time::Instant::now();
-                            if let Ok(new_device) =
-                                enumerator.GetDefaultAudioEndpoint(eRender, eConsole)
-                            {
-                                if let Ok(new_id) = new_device.GetId() {
-                                    let new_str = windows::core::PCWSTR::from_raw(new_id.0)
-                                        .to_string()
-                                        .unwrap_or_default();
-                                    CoTaskMemFree(Some(new_id.0 as *const _));
-                                    if current_id_str != new_str {
-                                        return Err("Default device changed".into());
-                                    }
-                                }
-                            }
-                        }
-
-                        // Skip all heavy processing if nothing is playing
-                        if !ANY_MEDIA_PLAYING.load(Ordering::Relaxed) {
-                            // Still gotta clear the buffer to avoid lag when it starts
-                            loop {
-                                let len = match capture_client.GetNextPacketSize() {
-                                    Ok(l) => l,
-                                    Err(_) => {
-                                        return Err("Device invalidated".into());
-                                    }
-                                };
-                                if len == 0 {
-                                    break;
-                                }
-                                let mut data_ptr: *mut u8 = std::ptr::null_mut();
-                                let mut num_frames = 0u32;
-                                let mut flags = 0u32;
-                                if capture_client
-                                    .GetBuffer(
-                                        &mut data_ptr,
-                                        &mut num_frames,
-                                        &mut flags,
-                                        None,
-                                        None,
-                                    )
-                                    .is_err()
-                                {
-                                    return Err("Device invalidated".into());
-                                }
-                                let _ = capture_client.ReleaseBuffer(num_frames);
-                            }
-                            continue;
-                        }
-
-                        let mut device_invalidated = false;
-                        loop {
-                            let packet_length = match capture_client.GetNextPacketSize() {
-                                Ok(len) => len,
-                                Err(_) => {
-                                    device_invalidated = true;
-                                    break;
-                                }
-                            };
-                            if packet_length == 0 {
-                                break;
-                            }
-                            let mut data_ptr: *mut u8 = std::ptr::null_mut();
-                            let mut num_frames = 0u32;
-                            let mut flags = 0u32;
-
-                            if capture_client
-                                .GetBuffer(&mut data_ptr, &mut num_frames, &mut flags, None, None)
-                                .is_err()
-                            {
-                                device_invalidated = true;
-                                break;
-                            }
-
-                            if !data_ptr.is_null()
-                                && num_frames > 0
-                                && bytes_per_sample > 0
-                                && channels > 0
-                            {
-                                let stride = channels * bytes_per_sample;
-                                for frame in 0..num_frames as usize {
-                                    let frame_offset = frame * stride;
-                                    let mut sample_val: i64 = 0;
-                                    for ch in 0..channels {
-                                        let sample_offset = frame_offset + ch * bytes_per_sample;
-                                        let sample: i64 = match bytes_per_sample {
-                                            2 => {
-                                                *(data_ptr.add(sample_offset) as *const i16) as i64
-                                            }
-                                            4 => {
-                                                *(data_ptr.add(sample_offset) as *const i32) as i64
-                                            }
-                                            _ => 0,
-                                        };
-                                        sample_val = sample_val.wrapping_add(sample);
-                                    }
-                                    sample_val /= channels as i64;
-                                    let normalized = match bytes_per_sample {
-                                        2 => (sample_val as f32) / 32768.0,
-                                        4 => (sample_val as f32) / 2147483648.0,
-                                        _ => 0.0,
-                                    };
-                                    if buffer_pos < FFT_SIZE {
-                                        let window = 0.5
-                                            * (1.0
-                                                - (2.0 * std::f32::consts::PI * buffer_pos as f32
-                                                    / FFT_SIZE as f32)
-                                                    .cos());
-                                        fft_buffer[buffer_pos] = normalized * window;
-                                        buffer_pos += 1;
-                                    }
-                                    if buffer_pos >= FFT_SIZE {
-                                        // Run FFT on the windowed buffer
-                                        for (i, &sample) in fft_buffer.iter().enumerate() {
-                                            fft_input[i] =
-                                                rustfft::num_complex::Complex::new(sample, 0.0);
-                                        }
-                                        fft.process(&mut fft_input);
-
-                                        let band_ranges =
-                                            [(1, 2), (2, 6), (6, 18), (18, 60), (60, 200)];
-                                        let mut output = [0.0f32; NUM_BANDS];
-                                        for (band_idx, &(bin_start, bin_end)) in
-                                            band_ranges.iter().enumerate()
-                                        {
-                                            let mut total_mag = 0.0f32;
-                                            let mut count = 0u32;
-                                            for bin in bin_start..bin_end {
-                                                if bin >= FFT_SIZE / 2 {
-                                                    break;
-                                                }
-                                                let mag = fft_input[bin].norm();
-                                                total_mag += mag;
-                                                count += 1;
-                                            }
-                                            let avg_mag = total_mag / count.max(1) as f32;
-                                            let mut scaled_mag = avg_mag;
-                                            let weighting = [1.2, 1.2, 1.5, 2.8, 5.0];
-                                            scaled_mag *= weighting[band_idx];
-                                            if scaled_mag > max_band_energies[band_idx] {
-                                                max_band_energies[band_idx] = scaled_mag;
-                                            } else {
-                                                max_band_energies[band_idx] *= 0.99;
-                                            }
-                                            let target = (scaled_mag
-                                                / max_band_energies[band_idx].max(0.12))
-                                            .min(1.0)
-                                            .powf(0.75);
-                                            let is_rising = target > prev_values[band_idx];
-                                            let smooth_factor = if is_rising { 0.10 } else { 0.20 };
-                                            output[band_idx] = prev_values[band_idx]
-                                                * smooth_factor
-                                                + target * (1.0 - smooth_factor);
-                                            output[band_idx] = output[band_idx].clamp(0.18, 1.0);
-                                            prev_values[band_idx] = output[band_idx];
-                                        }
-                                        let _ = app_handle.emit(
-                                            "audio-visualization",
-                                            AudioVisualizationData {
-                                                frequencies: output.to_vec(),
-                                            },
-                                        );
-                                        buffer_pos = 0;
-                                    }
-                                }
-                                let _ = capture_client.ReleaseBuffer(num_frames);
-                            }
-                        }
-
-                        if device_invalidated {
-                            return Err("Device invalidated".into());
-                        }
-                    }
-                })();
-
-                // Wait before retrying (increased to 2500ms to allow Windows to fully update default endpoint)
-                std::thread::sleep(std::time::Duration::from_millis(2500));
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        let mut analyzer = VisBandAnalyzer::new();
+        loop {
+            if !ANY_MEDIA_PLAYING.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(150));
+                continue;
             }
-            // if com_initialized { CoUninitialize(); }
+            if unsafe { run_visualizer_capture(&app_handle, &mut analyzer) }.is_err() {
+                // Give Windows time to settle on a new default endpoint.
+                std::thread::sleep(Duration::from_millis(2500));
+            }
         }
     });
 }
@@ -4668,6 +4848,56 @@ fn recover_from_webview_failure(handle: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    use super::{vis_mono_sample, vis_sample_format, VisBandAnalyzer, VisSampleFormat};
+
+    #[test]
+    fn visualizer_reads_the_mix_format_windows_actually_uses() {
+        // WAVE_FORMAT_EXTENSIBLE with a float SubFormat is the shared-mode
+        // default; it must not be read as 32-bit integers.
+        assert_eq!(vis_sample_format(0xFFFE, 32, Some(3)), Some(VisSampleFormat::F32));
+        assert_eq!(vis_sample_format(0xFFFE, 32, Some(1)), Some(VisSampleFormat::I32));
+        assert_eq!(vis_sample_format(3, 32, None), Some(VisSampleFormat::F32));
+        assert_eq!(vis_sample_format(1, 16, None), Some(VisSampleFormat::I16));
+        assert_eq!(vis_sample_format(1, 24, None), None);
+        assert_eq!(vis_sample_format(0xFFFE, 32, None), None);
+    }
+
+    #[test]
+    fn visualizer_averages_channels_into_one_sample() {
+        let float_frame: Vec<u8> = [0.5f32, -0.25]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        assert_eq!(vis_mono_sample(&float_frame, 2, VisSampleFormat::F32), 0.125);
+
+        let int_frame: Vec<u8> = [16384i16, 0].iter().flat_map(|s| s.to_le_bytes()).collect();
+        assert_eq!(vis_mono_sample(&int_frame, 2, VisSampleFormat::I16), 0.25);
+
+        let nan_frame: Vec<u8> = [f32::NAN, 0.5].iter().flat_map(|s| s.to_le_bytes()).collect();
+        assert_eq!(vis_mono_sample(&nan_frame, 2, VisSampleFormat::F32), 0.25);
+    }
+
+    #[test]
+    fn visualizer_bars_rest_on_silence_and_rise_with_sound() {
+        let mut analyzer = VisBandAnalyzer::new();
+        for _ in 0..super::VIS_FFT_SIZE - 1 {
+            assert_eq!(analyzer.push(0.0), None);
+        }
+        assert_eq!(analyzer.push(0.0), Some([super::VIS_FLOOR; super::VIS_BANDS]));
+
+        // Bins are 48000 / 512 = 93.75 Hz wide, so 1 kHz is bin 10.7, inside
+        // the third band (bins 6 to 18).
+        let mut bars = None;
+        for i in 0..super::VIS_FFT_SIZE * 4 {
+            let t = i as f32 / 48000.0;
+            bars = analyzer
+                .push(0.5 * (2.0 * std::f32::consts::PI * 1000.0 * t).sin())
+                .or(bars);
+        }
+        let bars = bars.expect("a full window was analysed");
+        assert!(bars[2] > 0.9, "tone band should be near full height: {bars:?}");
+    }
+
     #[test]
     fn smart_dock_overlap_uses_the_expanded_bar_instead_of_the_live_pill() {
         let expanded = super::dock_span_px(
