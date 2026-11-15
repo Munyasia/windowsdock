@@ -15,9 +15,17 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const repo = "SehajveerSingh2005/bloom";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const tag = process.argv[2];
+
+// Check the repo the app really updates from, read from its updater endpoint.
+const tauriConfig = JSON.parse(readFileSync(resolve(root, "src-tauri/tauri.conf.json"), "utf8"));
+const endpoint = tauriConfig.plugins?.updater?.endpoints?.[0] ?? "";
+const repo = endpoint.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/releases\//)?.[1];
+if (!repo) {
+	console.error(`Could not read a GitHub repo from the updater endpoint: ${endpoint || "(none)"}`);
+	process.exit(1);
+}
 
 const updaterSource = readFileSync(resolve(root, "src-tauri/src/updater.rs"), "utf8");
 const budgetSecs = Number(updaterSource.match(/CHECK_TIMEOUT_SECS: u64 = (\d+)/)?.[1]);
