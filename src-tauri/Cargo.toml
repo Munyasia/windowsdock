@@ -1,6 +1,6 @@
 [package]
 name = "bloom"
-version = "3.10.3"
+version = "3.10.4"
 description = "WindowsDock - a personal fork of Bloom"
 authors = ["sehaz", "Muse (Munyasia)"]
 edition = "2021"
