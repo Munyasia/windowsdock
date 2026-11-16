@@ -41,6 +41,18 @@ jobs:
         with:
           workspaces: src-tauri
 
+      - name: Check the signing key secret
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          # Without the key, installed copies would reject the update, so stop
+          # before spending 15 minutes on a build nobody can install.
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::The TAURI_SIGNING_PRIVATE_KEY secret is missing. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
       - name: Verify version matches tag
         shell: bash
         run: |
@@ -122,7 +134,7 @@ jobs:
           done <<< "$(git log "$RANGE" --no-merges --pretty=format:'COMMIT|%s' --name-only)"
           emit
 
-          NOTES=$(printf "## Bloom %s\n" "$VERSION")
+          NOTES=$(printf "## WindowsDock %s\n" "$VERSION")
           if [ -n "$FEATURES" ]; then
             NOTES+=$(printf "\n### What's New\n%s\n" "$FEATURES")
           fi
@@ -137,17 +149,29 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Install frontend dependencies
-        run: bun install
+        run: bun install --frozen-lockfile
+
+      - name: Turn on signed updater files
+        shell: bash
+        run: |
+          # tauri.conf.json keeps createUpdaterArtifacts off so local
+          # `bun run tauri build` works without the private key. Releases need
+          # the .sig files and latest.json, so switch it on for this build only.
+          bun -e "const fs=require('fs');const f='src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(f,'utf8'));c.bundle.createUpdaterArtifacts=true;fs.writeFileSync(f,JSON.stringify(c,null,2)+'\n')"
+          grep -n '"createUpdaterArtifacts"' src-tauri/tauri.conf.json
 
       - name: Build Tauri App
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # Tauri v2 reads the _PRIVATE_KEY_PASSWORD name; the short one is
+          # kept for older CLI versions.
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PASSWORD }}
           TAURI_SIGNING_PASSWORD: ${{ secrets.TAURI_SIGNING_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "Bloom ${{ github.ref_name }}"
+          releaseName: "WindowsDock ${{ github.ref_name }}"
           releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: false
           prerelease: false
