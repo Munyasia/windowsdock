@@ -97,6 +97,10 @@ const MAX_TIMER_SECONDS = 180 * 60;
 // Space between the date and the clock; matches .time-center.has-date's gap.
 const NOTCH_DATE_GAP = 8;
 
+// A notch opened by touch closes itself after this long without a tap, since
+// a finger never "leaves" it the way the mouse does.
+const TOUCH_IDLE_CLOSE_MS = 8000;
+
 // Accept both mm:ss and compact digits ("130" -> 1:30).
 const timerDigitsToSeconds = (value: string): number | null => {
 	if (!/^\d{1,5}$/.test(value) && !/^\d{1,3}:\d{1,2}$/.test(value)) return null;
@@ -1539,11 +1543,17 @@ function App() {
 	const rememberPanelRef = useRef<(panel: NotchPanel) => void>(() => {});
 	const notchPinnedRef = useRef(false);
 	const releaseDeferredRef = useRef(false);
+	// The kind of pointer behind the latest press ("mouse", "touch", "pen").
+	const lastPointerTypeRef = useRef("mouse");
+	// True while a mouse hovers the notch. Motion's hover gesture never fires
+	// for touch, so this stays false for a finger.
+	const mouseHoverRef = useRef(false);
 
 	// Shared hover-release, called on DOM hover end and when the backend
 	// reports the pointer left the (now click-through) notch window. Closes an
 	// open notch, remembering its panel, and returns to the resting mode.
 	const releaseNotchHover = () => {
+		mouseHoverRef.current = false;
 		// A view being typed into (a Wi-Fi password) keeps the notch open; the
 		// release happens once it lets go, if the pointer is still away.
 		if (notchPinnedRef.current) {
@@ -1570,6 +1580,43 @@ function App() {
 				: prev
 		);
 	};
+
+	// Touch has no hover. Motion's hover gesture ignores touch pointers and the
+	// backend's pointer-left check follows the mouse cursor, so nothing told a
+	// notch opened by a tap that the finger had moved on, and it stayed open.
+	// On touch, a second tap on the clock closes it (see toggleCalendarMode),
+	// and a notch left untouched for TOUCH_IDLE_CLOSE_MS closes itself.
+	const [touchTick, setTouchTick] = useState(0);
+	useEffect(() => {
+		if (windowLabel !== "main") return;
+		const onPointerDown = (e: PointerEvent) => {
+			lastPointerTypeRef.current = e.pointerType;
+			// Every tap restarts the countdown. A mouse press ends it, since the
+			// mouse closes the notch by leaving it.
+			if (e.pointerType === "touch") setTouchTick((tick) => tick + 1);
+			else setTouchTick(0);
+		};
+		// Capture phase, so presses that views stop from bubbling still count.
+		document.addEventListener("pointerdown", onPointerDown, true);
+		return () => document.removeEventListener("pointerdown", onPointerDown, true);
+	}, [windowLabel]);
+	useEffect(() => {
+		if (touchTick === 0) return;
+		const timer = setTimeout(() => {
+			if (mouseHoverRef.current) {
+				// The mouse has taken over and closes the notch by leaving it.
+				setTouchTick(0);
+			} else if (notchPinnedRef.current) {
+				// A view being typed into stays open; check again later.
+				setTouchTick((tick) => tick + 1);
+			} else {
+				releaseNotchHover();
+			}
+		}, TOUCH_IDLE_CLOSE_MS);
+		return () => clearTimeout(timer);
+		// releaseNotchHover only touches refs and state setters.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [touchTick]);
 
 	const clearShelfCollapse = () => {
 		if (shelfCollapseTimer.current !== null) {
@@ -2573,9 +2620,13 @@ function App() {
 			return;
 		}
 		// The time is part of the notch: a click opens it like anywhere else.
-		// Once open, it is a shortcut to the calendar.
+		// Once open, it is a shortcut to the calendar. A finger cannot close the
+		// notch by leaving it, so on touch a second tap closes it instead; the
+		// panel arrows still reach the calendar.
 		if (!isOpen) {
 			openNotch(openingPanel());
+		} else if (lastPointerTypeRef.current === "touch") {
+			releaseNotchHover();
 		} else if (settingsCalendarEnabled) {
 			setBloomMode("calendar");
 		}
@@ -2925,6 +2976,7 @@ function App() {
 					}}
 					onHoverStart={() => {
 						releaseDeferredRef.current = false;
+						mouseHoverRef.current = true;
 						setIsHovered(true);
 						// Hovering the shelf cancels its post-drop auto-close.
 						if (bloomMode === "shelf") clearShelfCollapse();
