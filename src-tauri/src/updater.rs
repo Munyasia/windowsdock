@@ -22,10 +22,11 @@ const MIN_AUTO_INSTALL_AGE_SECS: i64 = 24 * 60 * 60;
 /// on every startup, because the process exits from inside the install path.
 const AUTO_INSTALL_RETRY_SECS: i64 = 24 * 60 * 60;
 const STATE_FILE: &str = "update-state.json";
-/// WindowsDock fork: updates are OFF. The upstream Bloom updater would install the
-/// original author's release over this fork. Set to `true` only after you have
-/// your own signing key and GitHub releases (see WINDOWSDOCK.md).
-const UPDATES_ENABLED: bool = false;
+/// WindowsDock fork: updates come from github.com/Munyasia/windowsdock releases
+/// (the endpoint in tauri.conf.json), signed with this fork's own key. The
+/// pubkey there must match the TAURI_SIGNING_PRIVATE_KEY secret the release
+/// workflow signs with, or every installed copy rejects the update.
+const UPDATES_ENABLED: bool = true;
 
 /// Serializes manifest requests so concurrent callers share a single network hit.
 static CHECK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
