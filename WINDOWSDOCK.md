@@ -6,10 +6,10 @@ WindowsDock is Muse's personal fork of [Bloom](https://github.com/SehajveerSingh
 
 | Change | Why |
 | --- | --- |
-| Auto-updater off (`UPDATES_ENABLED = false` in `src-tauri/src/updater.rs`), `createUpdaterArtifacts: false` | The original updater would install upstream Bloom over your changes, and building needed the author's private signing key |
+| Updates come from this fork's GitHub releases, signed with its own key (`plugins.updater` in `tauri.conf.json`). `createUpdaterArtifacts` stays `false` for local builds; the release workflow turns it on | The original updater would install upstream Bloom over your changes, and signing needs a private key only you hold |
 | Name **WindowsDock**, ID `com.munyasia.windowsdock`, publisher, About tab | Windows treats it as your app; original author still credited (GPL requirement) |
 | Upstream announcements off (`src/hooks/useAnnouncement.ts`) | They were pulled from the author's website |
-| AI bot and release workflows moved to `.github/workflows-disabled/`; FUNDING.yml removed | They needed the author's API keys and secrets |
+| AI bot workflows moved to `.github/workflows-disabled/`; FUNDING.yml removed | They needed the author's API keys and secrets |
 | Internal names kept: `bloom.exe`, window titles "Bloom"/"Bloom Dock" | The code finds its own windows by these names. Renaming them would make the dock show itself as an app |
 
 ## 1. One-time Windows setup
@@ -49,16 +49,19 @@ bun run tauri build
 
 The installer lands in `src-tauri\target\release\bundle\nsis\WindowsDock_<version>_x64-setup.exe`. Run it. Windows SmartScreen may warn because the app isn't code-signed. Click **More info → Run anyway**.
 
+You only need this for a first install or to try a build before releasing it. Installed copies update themselves from releases (section 7).
+
 ## 5. Your everyday loop
 
 ```powershell
 git checkout -b my-change     # optional: a branch per idea
 # ...edit files, test with: bun run tauri dev
 git add -A
-git commit -m "Describe what you changed"
+git commit -m "fix: describe what you changed"
 git push
-bun run tauri build           # rebuild and reinstall when happy
 ```
+
+When the change is on `main` and you want every install to get it, ship a release (section 7).
 
 ## 6. Pull in improvements from the original Bloom
 
@@ -76,12 +79,22 @@ Resolve any conflicts (usually in the files listed above), test, then push.
 - `src-tauri/tauri.conf.json`: app name, ID, windows, installer settings
 - `public/`: logos and images (replace `bloom.png` / `bloom.svg` with your own logo)
 
-## Turning updates back on later (optional)
+## 7. Shipping an update
 
-1. `bun run tauri signer generate -w $HOME\.tauri\windowsdock.key`
-2. Put the new **public** key in `plugins.updater.pubkey` in `tauri.conf.json`
-3. Set `UPDATES_ENABLED = true` and `createUpdaterArtifacts: true`
-4. Add `TAURI_SIGNING_PRIVATE_KEY` as a GitHub secret, and move `release.yml` back into `.github/workflows/`
+1. On `main`, with everything committed and pushed, run `bun run release 3.10.5` (use the next version number). It bumps the four version files, commits, tags `v3.10.5` and pushes.
+2. GitHub Actions builds and signs it. Watch the **Release** run in the repo's Actions tab; it takes 15 to 20 minutes.
+3. Every installed copy now finds it under **Settings > About > Check for Updates**. Click it, then click **Update Available** to install. With **Auto Update** on, it installs by itself on startup once the release is a day old.
+4. `bun scripts/verify-updater.mjs v3.10.5` checks the release can be downloaded the way the app does it.
+
+If a release turns out broken, edit it on GitHub and tick **Set as a pre-release**. Update checks then fall back to the previous release.
+
+### The signing key
+
+Installed copies only accept updates signed with the key whose public half is in `plugins.updater.pubkey`.
+
+- The private key lives at `$HOME\.tauri\windowsdock.key`. Keep its password in your password manager and back up both.
+- GitHub holds copies as the repo secrets `TAURI_SIGNING_PRIVATE_KEY` (the file's contents) and `TAURI_SIGNING_PASSWORD`.
+- If you lose the key, a new one means every user has to reinstall by hand once more, because their copies only trust the old key.
 
 ## License
 
